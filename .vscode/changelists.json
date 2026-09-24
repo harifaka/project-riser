@@ -1,0 +1,25 @@
+{
+  "changelists": [
+    {
+      "name": "Default",
+      "files": [
+        ".idea/.gitignore",
+        ".idea/inspectionProfiles/Project_Default.xml",
+        ".idea/inspectionProfiles/profiles_settings.xml",
+        ".idea/misc.xml",
+        ".idea/modules.xml",
+        ".idea/project-riser.iml",
+        ".idea/vcs.xml",
+        "tests/test_chat_parser.py",
+        ".vscode/changelists.json",
+        "app.py",
+        "static/js/app.js",
+        "templates/index.html",
+        "static/css/style.css",
+        "uploads/chat.json",
+        "uploads/gemini_1.html"
+      ]
+    }
+  ],
+  "active": "Default"
+}

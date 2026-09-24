@@ -6,15 +6,18 @@ import requests
 import re
 import io
 import zipfile
+import html
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify, send_file
 from github import Github
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'output'
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 class FIFOCache:
     def __init__(self, capacity=5):
@@ -41,6 +44,7 @@ class StateManager:
         self.chat_tags = ["backend", "frontend", "debugging", "architecture", "database", "devops"]
         self.repo_tags = ["backend", "frontend", "abandoned", "react", "python", "data_science"]
         self.conversations = []
+        self.chat_files = []
         self.repos = []
         self.stats = {"total_loc": 0, "abandoned_count": 0, "secrets_found": 0, "smells_found": 0}
         self.repo_cache = FIFOCache(capacity=5)
@@ -59,34 +63,133 @@ class LLMService:
 
 class ChatAnalyzer:
     @staticmethod
+    def _clean_text(value):
+        if not value:
+            return ""
+        text = html.unescape(str(value))
+        text = re.sub(r"<[^>]+>", " ", text, flags=re.DOTALL)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_html_text(raw_html):
+        if not raw_html:
+            return []
+        text = re.sub(r"(?is)<script.*?</script>", " ", raw_html)
+        text = re.sub(r"(?is)<style.*?</style>", " ", text)
+        blocks = []
+        for pattern in [
+            r"(?is)<(?:p|li|div|article|span|pre|h[1-6]|td|tr)\b[^>]*>(.*?)</(?:p|li|div|article|span|pre|h[1-6]|td|tr)>",
+            r"(?is)<title\b[^>]*>(.*?)</title>",
+            r"(?is)\b(?:prompt|response|user|assistant|message|content)\b[^<]*<.*?>(.*?)</.*?>"
+        ]:
+            for match in re.finditer(pattern, text):
+                cleaned = ChatAnalyzer._clean_text(match.group(1))
+                if cleaned:
+                    blocks.append(cleaned)
+        if not blocks:
+            blocks = [ChatAnalyzer._clean_text(re.sub(r"<[^>]+>", " ", text, flags=re.DOTALL))]
+        return [b for b in blocks if b]
+
+    @staticmethod
+    def _extract_from_mapping(mapping):
+        parts = []
+
+        def add_value(value):
+            if isinstance(value, str):
+                if value.strip():
+                    parts.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    add_value(item)
+            elif isinstance(value, dict):
+                for key in ("text", "content", "parts", "value", "message", "response", "prompt"):
+                    if key in value:
+                        add_value(value[key])
+
+        if not isinstance(mapping, dict):
+            return parts
+
+        for node in mapping.values():
+            if isinstance(node, dict):
+                add_value(node)
+            elif isinstance(node, str):
+                add_value(node)
+
+        return [p for p in parts if p]
+
+    @staticmethod
+    def _extract_from_json(data):
+        found = []
+        if isinstance(data, list):
+            for item in data:
+                found.extend(ChatAnalyzer._extract_from_json(item))
+        elif isinstance(data, dict):
+            if "mapping" in data:
+                found.append({"title": data.get("title", "Imported Chat"), "source": "ChatGPT", "text_parts": ChatAnalyzer._extract_from_mapping(data.get("mapping"))})
+            elif "messages" in data:
+                text_parts = []
+                for msg in data.get("messages", []):
+                    if isinstance(msg, dict):
+                        if "text" in msg and isinstance(msg["text"], str):
+                            text_parts.append(msg["text"])
+                        for key in ("content", "parts", "value"):
+                            if key in msg:
+                                value = msg[key]
+                                if isinstance(value, str):
+                                    text_parts.append(value)
+                                elif isinstance(value, list):
+                                    text_parts.extend([str(v) for v in value if isinstance(v, str)])
+                if text_parts:
+                    found.append({"title": data.get("title", "Imported Chat"), "source": "Gemini", "text_parts": text_parts})
+            else:
+                for key in ("title", "text", "content", "prompt", "response", "value"):
+                    if key in data and isinstance(data[key], str):
+                        found.append({"title": data.get("title", "Imported Chat"), "source": "Gemini", "text_parts": [data[key]]})
+                        break
+                if not found:
+                    if "conversations" in data:
+                        found.extend(ChatAnalyzer._extract_from_json(data["conversations"]))
+                    if "chat" in data:
+                        found.extend(ChatAnalyzer._extract_from_json(data["chat"]))
+        return found
+
+    @staticmethod
     def parse_and_analyze(file_data, url, model):
         extracted = []
+        raw_text = (file_data or "").strip()
+        if not raw_text:
+            return extracted
+
         try:
-            data = json.loads(file_data)
-            if isinstance(data, list):
-                for conv in data:
-                    text_parts = []
-                    title = conv.get("title", "Imported Chat")
-                    source = "ChatGPT" if "mapping" in conv else "Gemini"
-                    if source == "ChatGPT":
-                        for node in conv.get("mapping", {}).values():
-                            msg = node.get("message")
-                            if msg and msg.get("content") and msg["content"].get("parts"):
-                                text_parts.extend([str(p) for p in msg["content"]["parts"] if isinstance(p, str)])
-                    else:
-                        for msg in conv.get("messages", []):
-                            if "text" in msg: text_parts.append(msg["text"])
-                    if text_parts:
-                        full_text = " ".join(text_parts)
-                        last_messages = " ".join(text_parts[-3:])
-                        prompt = f"Analyze the end of this dev chat. Did the user get a solution (SOLVED), did the AI fail giving bad context (CONTEXT_LOST), or did it just end abruptly (TIMEOUT)? Reply with ONE exact word.\nChat end: {last_messages[-1000:]}"
-                        closure = LLMService.ask(prompt, url, model)
-                        if closure not in ["SOLVED", "CONTEXT_LOST", "TIMEOUT"]: closure = "TIMEOUT"
-                        extracted.append({
-                            "id": str(uuid.uuid4()), "title": title, "source": source,
-                            "text": full_text[:3000], "closure_reason": closure, "tags": {"backend": 0.8}
-                        })
-        except Exception as e: print(f"Chat parse error: {e}")
+            payload = json.loads(raw_text)
+            parsed_entries = ChatAnalyzer._extract_from_json(payload)
+        except Exception:
+            parsed_entries = []
+
+        if not parsed_entries and ("<html" in raw_text.lower() or "<div" in raw_text.lower() or "<p" in raw_text.lower()):
+            title = re.search(r"(?is)<title\b[^>]*>(.*?)</title>", raw_text)
+            title_text = ChatAnalyzer._clean_text(title.group(1)) if title else "Gemini Export"
+            parsed_entries = [{"title": title_text, "source": "Gemini", "text_parts": ChatAnalyzer._extract_html_text(raw_text)}]
+
+        if not parsed_entries:
+            parsed_entries = [{"title": "Imported Chat", "source": "Gemini", "text_parts": [raw_text[:4000]]}]
+
+        for conv in parsed_entries:
+            text_parts = conv.get("text_parts", [])
+            if not text_parts:
+                continue
+            title = conv.get("title", "Imported Chat")
+            source = conv.get("source", "Gemini")
+            full_text = " ".join(text_parts)
+            last_messages = " ".join(text_parts[-3:])
+            prompt = f"Analyze the end of this dev chat. Did the user get a solution (SOLVED), did the AI fail giving bad context (CONTEXT_LOST), or did it just end abruptly (TIMEOUT)? Reply with ONE exact word.\nChat end: {last_messages[-1000:]}"
+            closure = LLMService.ask(prompt, url, model)
+            if closure not in ["SOLVED", "CONTEXT_LOST", "TIMEOUT"]: closure = "TIMEOUT"
+            extracted.append({
+                "id": str(uuid.uuid4()), "title": title, "source": source,
+                "text": full_text[:3000], "closure_reason": closure, "tags": {"backend": 0.8}
+            })
         return extracted
 
 class RepoAnalyzer:
@@ -259,12 +362,49 @@ def update_settings():
     state.repo_cache.set_capacity(capacity)
     return jsonify({"status": "success", "capacity": state.repo_cache.capacity})
 
+def _chat_file_entry(filename):
+    return {"name": filename, "size": os.path.getsize(os.path.join(app.config['UPLOAD_FOLDER'], filename)), "uploaded_at": datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+@app.route('/api/chat_files', methods=['GET'])
+def list_chat_files():
+    return jsonify({"files": state.chat_files})
+
+@app.route('/api/chat_files/<path:filename>', methods=['DELETE'])
+def delete_chat_file(filename):
+    safe_name = secure_filename(filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], safe_name)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    state.chat_files = [f for f in state.chat_files if f["name"] != safe_name]
+    state.conversations = [c for c in state.conversations if c.get("source_file") != safe_name]
+    return jsonify({"status": "success", "removed": safe_name})
+
 @app.route('/api/upload_chats', methods=['POST'])
 def upload_chats():
     url, model = request.form.get("ollama_url"), request.form.get("ollama_model")
+    uploaded_count = 0
     for file in request.files.getlist("file"):
-        state.conversations.extend(ChatAnalyzer.parse_and_analyze(file.read().decode('utf-8', errors='ignore'), url, model))
-    return jsonify({"status": "success", "count": len(state.conversations)})
+        if not file or not file.filename:
+            continue
+        original_name = secure_filename(file.filename)
+        unique_name = original_name
+        counter = 1
+        while os.path.exists(os.path.join(app.config['UPLOAD_FOLDER'], unique_name)):
+            stem, ext = os.path.splitext(original_name)
+            unique_name = f"{stem}_{counter}{ext}"
+            counter += 1
+        file_content = file.read()
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
+        with open(file_path, 'wb') as uploaded_file:
+            uploaded_file.write(file_content)
+        parsed = ChatAnalyzer.parse_and_analyze(file_content.decode('utf-8', errors='ignore'), url, model)
+        for chat in parsed:
+            chat["source_file"] = unique_name
+        state.conversations.extend(parsed)
+        uploaded_count += len(parsed)
+        state.chat_files = [f for f in state.chat_files if f["name"] != unique_name]
+        state.chat_files.append(_chat_file_entry(unique_name))
+    return jsonify({"status": "success", "count": uploaded_count, "files": state.chat_files})
 
 @app.route('/api/github/scan', methods=['POST'])
 def scan_github():

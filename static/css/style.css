@@ -31,6 +31,11 @@ h1 { margin: 0 0 8px 0; font-size: 1.8rem; }
 .badge.mood { border-color: var(--warning); color: var(--warning); }
 .badge.tshirt { background: var(--primary); color: #fff; border: none; }
 .card-desc { background: var(--bg-dark); padding: 12px; border-radius: 6px; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px; border: 1px solid var(--border); line-height: 1.5; }
+.file-list { display: grid; gap: 10px; }
+.file-item { display: flex; justify-content: space-between; align-items: center; gap: 12px; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.file-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-item small { color: var(--text-muted); }
+.muted { color: var(--text-muted); }
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
 .form-group { margin-bottom: 16px; }

@@ -38,12 +38,16 @@
         <div class="header">
             <div>
                 <h1>AI Chat Corpus</h1>
-                <p class="subtitle">Import ChatGPT & Gemini histories to map closure intents.</p>
+                <p class="subtitle">Import ChatGPT JSON or Gemini HTML/text exports to map closure intents.</p>
             </div>
-            <input type="file" id="chatInput" multiple accept=".json" style="display:none;" onchange="app.uploadChats()">
-            <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload JSONs</button>
+            <input type="file" id="chatInput" multiple accept="*/*" style="display:none;" onchange="app.uploadChats()">
+            <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload Any Chats</button>
         </div>
         <div id="chatStatus" class="status-text"></div>
+        <div class="card" style="margin-top:16px;">
+            <h3 style="margin-top:0;">Imported Files</h3>
+            <div id="chatFilesList" class="file-list"></div>
+        </div>
         <div class="grid" id="chatContainer"></div>
     </div>
 

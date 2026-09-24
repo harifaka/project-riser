@@ -5,6 +5,7 @@ const app = {
         document.getElementById('ollamaUrl').value = localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
         document.getElementById('cacheSlider').value = localStorage.getItem('cacheSize') || 5;
         document.getElementById('cacheVal').innerText = document.getElementById('cacheSlider').value;
+        this.listChatFiles();
         setInterval(this.pollData.bind(this), 3000);
     },
     switchTab(tab) {
@@ -41,6 +42,32 @@ const app = {
         const res = await fetch('/api/upload_chats', { method: 'POST', body: formData });
         const data = await res.json();
         document.getElementById('chatStatus').innerText = `✅ Processed ${data.count} chats.`;
+        input.value = '';
+        this.listChatFiles();
+    },
+    async listChatFiles() {
+        const res = await fetch('/api/chat_files');
+        const data = await res.json();
+        const list = document.getElementById('chatFilesList');
+        if (!data.files || !data.files.length) {
+            list.innerHTML = '<div class="muted">No uploaded chat files yet.</div>';
+            return;
+        }
+        list.innerHTML = data.files.map(file => `
+            <div class="file-item">
+                <span>${file.name}</span>
+                <small>${file.uploaded_at}</small>
+                <button class="btn outline" onclick="app.deleteChatFile('${file.name}')">Delete</button>
+            </div>
+        `).join('');
+    },
+    async deleteChatFile(name) {
+        const res = await fetch(`/api/chat_files/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.status === 'success') {
+            document.getElementById('chatStatus').innerText = `🗑️ Removed ${data.removed}.`;
+            this.listChatFiles();
+        }
     },
     async pollData() {
         const statRes = await fetch('/api/stats');
