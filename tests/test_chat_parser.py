@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from app import ChatAnalyzer
+from app import ChatAnalyzer, LLMService
 
 
 class ChatAnalyzerTests(unittest.TestCase):
@@ -62,6 +63,21 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(len(conversations), 1)
         self.assertEqual(conversations[0]["source"], "Gemini")
         self.assertIn("deployment timeout", conversations[0]["text"].lower())
+
+    @patch("app.requests.get")
+    def test_lists_available_ollama_models(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "models": [
+                {"name": "mistral:latest"},
+                {"name": "llama3.1:8b"}
+            ]
+        }
+
+        self.assertEqual(
+            LLMService.list_available_models("http://localhost:11434"),
+            ["mistral:latest", "llama3.1:8b"]
+        )
 
 
 if __name__ == "__main__":

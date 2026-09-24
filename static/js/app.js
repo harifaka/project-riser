@@ -5,8 +5,33 @@ const app = {
         document.getElementById('ollamaUrl').value = localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
         document.getElementById('cacheSlider').value = localStorage.getItem('cacheSize') || 5;
         document.getElementById('cacheVal').innerText = document.getElementById('cacheSlider').value;
+        this.refreshOllamaModels();
         this.listChatFiles();
         setInterval(this.pollData.bind(this), 3000);
+    },
+    async refreshOllamaModels() {
+        const url = document.getElementById('ollamaUrl')?.value || localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
+        const select = document.getElementById('ollamaModel');
+        if (!select) return;
+
+        const savedModel = localStorage.getItem('ollamaModel') || 'llama3.1';
+        select.innerHTML = '<option value="llama3.1">Loading models…</option>';
+        select.disabled = true;
+
+        try {
+            const res = await fetch(`/api/ollama/models?url=${encodeURIComponent(url)}`);
+            const data = await res.json();
+            const models = Array.isArray(data.models) && data.models.length ? data.models : ['llama3.1'];
+            select.innerHTML = models.map(model => `<option value="${model}">${model}</option>`).join('');
+            const chosen = models.includes(savedModel) ? savedModel : models[0];
+            select.value = chosen;
+            localStorage.setItem('ollamaModel', chosen);
+        } catch (error) {
+            select.innerHTML = '<option value="llama3.1">llama3.1</option>';
+            localStorage.setItem('ollamaModel', 'llama3.1');
+        } finally {
+            select.disabled = false;
+        }
     },
     switchTab(tab) {
         document.getElementById('reposTab').style.display = tab === 'repos' ? 'block' : 'none';
@@ -19,25 +44,30 @@ const app = {
         m.style.display = m.style.display === 'none' ? 'flex' : 'none';
     },
     async saveSettings() {
+        const url = document.getElementById('ollamaUrl').value.trim() || 'http://localhost:11434';
+        const model = document.getElementById('ollamaModel')?.value || localStorage.getItem('ollamaModel') || 'llama3.1';
         localStorage.setItem('ghToken', document.getElementById('ghToken').value);
-        localStorage.setItem('ollamaUrl', document.getElementById('ollamaUrl').value);
+        localStorage.setItem('ollamaUrl', url);
+        localStorage.setItem('ollamaModel', model);
         localStorage.setItem('cacheSize', document.getElementById('cacheSlider').value);
-        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({cache_size: document.getElementById('cacheSlider').value}) });
+        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({cache_size: document.getElementById('cacheSlider').value, ollama_url: url, ollama_model: model}) });
         this.toggleSettings();
     },
     async scanRepos() {
         const token = localStorage.getItem('ghToken');
         if(!token) return alert("Please configure GitHub PAT in settings.");
+        const url = localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
+        const model = localStorage.getItem('ollamaModel') || 'llama3.1';
         document.getElementById('repoStatus').innerText = "⏳ Streaming ZIPs into RAM & Analyzing...";
-        await fetch('/api/github/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token, ollama_url: localStorage.getItem('ollamaUrl'), ollama_model: 'llama3.1'}) });
+        await fetch('/api/github/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token, ollama_url: url, ollama_model: model}) });
     },
     async uploadChats() {
         const input = document.getElementById('chatInput');
         if(!input.files.length) return;
         const formData = new FormData();
         for(let f of input.files) formData.append('file', f);
-        formData.append('ollama_url', localStorage.getItem('ollamaUrl'));
-        formData.append('ollama_model', 'llama3.1');
+        formData.append('ollama_url', localStorage.getItem('ollamaUrl') || 'http://localhost:11434');
+        formData.append('ollama_model', localStorage.getItem('ollamaModel') || 'llama3.1');
         document.getElementById('chatStatus').innerText = "⏳ Parsing...";
         const res = await fetch('/api/upload_chats', { method: 'POST', body: formData });
         const data = await res.json();

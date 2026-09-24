@@ -54,6 +54,28 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 class LLMService:
     @staticmethod
+    def list_available_models(url):
+        if not url:
+            return ["llama3.1"]
+        try:
+            res = requests.get(f"{url}/api/tags", timeout=15)
+            if res.status_code != 200:
+                return ["llama3.1"]
+            payload = res.json() or {}
+            models = []
+            for entry in payload.get("models", []):
+                if isinstance(entry, dict) and entry.get("name"):
+                    models.append(entry["name"])
+            if models:
+                return models
+            for entry in payload.get("data", []):
+                if isinstance(entry, dict) and entry.get("name"):
+                    models.append(entry["name"])
+            return models or ["llama3.1"]
+        except Exception:
+            return ["llama3.1"]
+
+    @staticmethod
     def ask(prompt, url, model):
         if not url or not model: return "LLM not configured."
         try:
@@ -358,9 +380,20 @@ def get_analytics():
 
 @app.route('/api/settings', methods=['POST'])
 def update_settings():
-    capacity = int(request.json.get('cache_size', 5))
+    payload = request.get_json(silent=True) or {}
+    capacity = int(payload.get('cache_size', state.repo_cache.capacity))
     state.repo_cache.set_capacity(capacity)
-    return jsonify({"status": "success", "capacity": state.repo_cache.capacity})
+    return jsonify({
+        "status": "success",
+        "capacity": state.repo_cache.capacity,
+        "ollama_url": payload.get('ollama_url'),
+        "ollama_model": payload.get('ollama_model')
+    })
+
+@app.route('/api/ollama/models', methods=['GET'])
+def get_ollama_models():
+    url = request.args.get('url') or 'http://localhost:11434'
+    return jsonify({"models": LLMService.list_available_models(url)})
 
 def _chat_file_entry(filename):
     return {"name": filename, "size": os.path.getsize(os.path.join(app.config['UPLOAD_FOLDER'], filename)), "uploaded_at": datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
