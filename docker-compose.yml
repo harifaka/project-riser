@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  riser-app:
+    build: .
+    container_name: project_riser_v7
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./output:/app/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

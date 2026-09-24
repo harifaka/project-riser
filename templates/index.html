@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Project Riser v7 🚀</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">🚀 Project Riser v7</div>
+        <div class="stats-grid">
+            <div class="stat-card"><span>Dead LoC</span><strong id="statLoc">0</strong></div>
+            <div class="stat-card"><span>Dead Repos</span><strong id="statDead" class="danger">0</strong></div>
+        </div>
+        <nav>
+            <button class="nav-btn active" onclick="app.switchTab('repos')">📂 Repository Graveyard</button>
+            <button class="nav-btn" onclick="app.switchTab('chats')">💬 Chat AI Corpus</button>
+            <button class="nav-btn outline" style="border-color:var(--primary); color:var(--primary); margin-top:10px;" onclick="app.openGraveyardAnalytics()">📊 Graveyard Analytics</button>
+        </nav>
+        <div class="spacer"></div>
+        <button class="nav-btn outline" onclick="app.toggleSettings()">⚙️ Settings & Cache</button>
+    </div>
+
+    <div class="main-content" id="reposTab">
+        <div class="header">
+            <div>
+                <h1>In-Memory Resurrection</h1>
+                <p class="subtitle">Streaming GitHub ZIPs into Virtual RAM Cache.</p>
+            </div>
+            <button class="btn primary" onclick="app.scanRepos()">🔄 Sync GitHub</button>
+        </div>
+        <div id="repoStatus" class="status-text"></div>
+        <div class="grid" id="repoContainer"></div>
+    </div>
+
+    <div class="main-content" id="chatsTab" style="display:none;">
+        <div class="header">
+            <div>
+                <h1>AI Chat Corpus</h1>
+                <p class="subtitle">Import ChatGPT & Gemini histories to map closure intents.</p>
+            </div>
+            <input type="file" id="chatInput" multiple accept=".json" style="display:none;" onchange="app.uploadChats()">
+            <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload JSONs</button>
+        </div>
+        <div id="chatStatus" class="status-text"></div>
+        <div class="grid" id="chatContainer"></div>
+    </div>
+
+    <!-- Analytics Modal (Exportable) -->
+    <div class="modal-backdrop" id="analyticsModal" style="display:none; align-items:flex-start; padding-top:40px; overflow-y:auto;">
+        <div class="modal" id="analyticsDashboard" style="width: 900px; max-width:95%; background:#0a0a0a; border: 2px solid var(--primary);">
+            <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
+                <h2 style="margin:0; color:var(--primary);">🪦 Graveyard Analytics</h2>
+                <div class="logo">Project Riser v7</div>
+            </div>
+            
+            <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:20px;">
+                <div class="card" style="background:#111;">
+                    <h3 style="color:var(--text-muted);">Coma Index</h3>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>Fresh Dead (<30d)</span><strong id="axFresh">0</strong></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>Decomposing (<180d)</span><strong id="axDecomp">0</strong></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>Skeleton (<365d)</span><strong id="axSkeleton">0</strong></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>Fossil (>365d)</span><strong id="axFossil">0</strong></div>
+                </div>
+                <div class="card" style="background:#111;">
+                    <h3 style="color:var(--text-muted);">Mood X-Ray (Mental Debt)</h3>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>🤬 Frustrated</span><strong id="axFrustrated" class="danger">0</strong></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>🥱 Bored</span><strong id="axBored" class="warning">0</strong></div>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:5px;"><span>✅ Done</span><strong id="axDone" class="success">0</strong></div>
+                </div>
+            </div>
+            
+            <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:20px;">
+                <div class="card" style="background:#111; text-align:center;">
+                    <h3 style="color:var(--text-muted);">AI Corpus Match Score</h3>
+                    <div style="font-size:3rem; font-weight:800; color:var(--primary);" id="axAiScore">0%</div>
+                    <div style="font-size:0.8rem; color:#888;">Untapped AI Knowledge Potential</div>
+                </div>
+                <div class="card" style="background:#111;">
+                    <h3 style="color:var(--text-muted);">Resurrection Cost (T-Shirt)</h3>
+                    <div style="display:flex; justify-content:space-around; align-items:flex-end; height:80px; margin-top:20px;">
+                        <div style="text-align:center;">
+                            <div id="axS" style="background:var(--success); width:40px; border-radius:4px 4px 0 0; margin:0 auto;"></div>
+                            <span style="font-weight:bold;">S</span>
+                        </div>
+                        <div style="text-align:center;">
+                            <div id="axM" style="background:var(--primary); width:40px; border-radius:4px 4px 0 0; margin:0 auto;"></div>
+                            <span style="font-weight:bold;">M</span>
+                        </div>
+                        <div style="text-align:center;">
+                            <div id="axL" style="background:var(--warning); width:40px; border-radius:4px 4px 0 0; margin:0 auto;"></div>
+                            <span style="font-weight:bold;">L</span>
+                        </div>
+                        <div style="text-align:center;">
+                            <div id="axXL" style="background:var(--danger); width:40px; border-radius:4px 4px 0 0; margin:0 auto;"></div>
+                            <span style="font-weight:bold;">XL</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Hide these buttons during screenshot -->
+            <div class="modal-actions no-print">
+                <button class="btn outline" onclick="document.getElementById('analyticsModal').style.display='none'">Close</button>
+                <button class="btn primary" onclick="app.takeScreenshot()">📸 Share to Reddit</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div class="modal-backdrop" id="settingsModal" style="display:none;">
+        <div class="modal">
+            <h2>Settings & Resources</h2>
+            <div class="form-group"><label>GitHub PAT Token</label><input type="password" id="ghToken"></div>
+            <div class="form-group"><label>Virtual RAM Cache Limit</label><input type="range" id="cacheSlider" min="1" max="20" value="5" oninput="document.getElementById('cacheVal').innerText=this.value"><div style="text-align:right;"><span id="cacheVal">5</span> repos</div></div>
+            <div class="form-group"><label>Ollama API URL</label><input type="text" id="ollamaUrl" value="http://localhost:11434"></div>
+            <div class="modal-actions"><button class="btn outline" onclick="app.toggleSettings()">Close</button><button class="btn primary" onclick="app.saveSettings()">Save Configuration</button></div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop" id="ttModal" style="display:none;">
+        <div class="modal" style="width: 800px; max-width:95%;">
+            <h2>⏳ Time Travel Master Prompt</h2>
+            <textarea id="ttPromptArea" style="width:100%; height:300px; background:var(--bg-dark); color:var(--text-main); border:1px solid var(--border); padding:10px; font-family:monospace; resize:vertical;"></textarea>
+            <div class="modal-actions"><button class="btn outline" onclick="document.getElementById('ttModal').style.display='none'">Close</button><button class="btn primary" onclick="app.copyPrompt()">📋 Copy</button></div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
