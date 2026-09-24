@@ -79,6 +79,16 @@ class ChatAnalyzerTests(unittest.TestCase):
             ["mistral:latest", "llama3.1:8b"]
         )
 
+    @patch("app.os.path.exists", return_value=True)
+    @patch("app.requests.get")
+    def test_resolves_docker_ollama_url(self, mock_get, mock_exists):
+        mock_get.return_value.status_code = 200
+
+        self.assertEqual(
+            LLMService.resolve_ollama_url("http://localhost:11434"),
+            "http://host.docker.internal:11434"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

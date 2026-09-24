@@ -54,11 +54,52 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 class LLMService:
     @staticmethod
+    def is_running_in_docker():
+        return os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER') == 'true'
+
+    @staticmethod
+    def resolve_ollama_url(url=None):
+        preferred = (url or '').strip()
+        candidates = []
+        if LLMService.is_running_in_docker():
+            candidates.extend([
+                'http://host.docker.internal:11434',
+                'http://gateway.docker.internal:11434',
+                'http://172.17.0.1:11434',
+                'http://ollama:11434'
+            ])
+            if preferred:
+                candidates.append(preferred)
+        else:
+            if preferred:
+                candidates.append(preferred)
+            candidates.extend([
+                'http://localhost:11434',
+                'http://127.0.0.1:11434'
+            ])
+
+        seen = set()
+        for candidate in candidates:
+            norm = candidate.rstrip('/')
+            if norm in seen:
+                continue
+            seen.add(norm)
+            try:
+                resp = requests.get(f"{norm}/api/tags", timeout=3)
+                if resp.status_code == 200:
+                    return norm
+            except Exception:
+                continue
+
+        if preferred:
+            return preferred.rstrip('/')
+        return ('http://host.docker.internal:11434' if LLMService.is_running_in_docker() else 'http://localhost:11434')
+
+    @staticmethod
     def list_available_models(url):
-        if not url:
-            return ["llama3.1"]
+        resolved_url = LLMService.resolve_ollama_url(url)
         try:
-            res = requests.get(f"{url}/api/tags", timeout=15)
+            res = requests.get(f"{resolved_url}/api/tags", timeout=15)
             if res.status_code != 200:
                 return ["llama3.1"]
             payload = res.json() or {}
@@ -390,9 +431,13 @@ def update_settings():
         "ollama_model": payload.get('ollama_model')
     })
 
+@app.route('/api/ollama/resolve-url', methods=['GET'])
+def resolve_ollama_url():
+    return jsonify({"url": LLMService.resolve_ollama_url(request.args.get('url'))})
+
 @app.route('/api/ollama/models', methods=['GET'])
 def get_ollama_models():
-    url = request.args.get('url') or 'http://localhost:11434'
+    url = request.args.get('url')
     return jsonify({"models": LLMService.list_available_models(url)})
 
 def _chat_file_entry(filename):

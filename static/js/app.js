@@ -1,13 +1,34 @@
 
 const app = {
     init() {
+        const urlField = document.getElementById('ollamaUrl');
+        const savedUrl = localStorage.getItem('ollamaUrl');
+        urlField.value = savedUrl || '';
         document.getElementById('ghToken').value = localStorage.getItem('ghToken') || '';
-        document.getElementById('ollamaUrl').value = localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
         document.getElementById('cacheSlider').value = localStorage.getItem('cacheSize') || 5;
         document.getElementById('cacheVal').innerText = document.getElementById('cacheSlider').value;
-        this.refreshOllamaModels();
+        urlField.addEventListener('change', () => this.refreshOllamaModels());
+        urlField.addEventListener('blur', () => this.refreshOllamaModels());
+        this.resolveOllamaUrl();
         this.listChatFiles();
         setInterval(this.pollData.bind(this), 3000);
+    },
+    async resolveOllamaUrl() {
+        const urlField = document.getElementById('ollamaUrl');
+        try {
+            const res = await fetch('/api/ollama/resolve-url');
+            const data = await res.json();
+            const resolved = data.url || 'http://localhost:11434';
+            urlField.value = resolved;
+            localStorage.setItem('ollamaUrl', resolved);
+            await this.refreshOllamaModels();
+        } catch (error) {
+            if (!urlField.value) {
+                urlField.value = 'http://localhost:11434';
+                localStorage.setItem('ollamaUrl', urlField.value);
+            }
+            await this.refreshOllamaModels();
+        }
     },
     async refreshOllamaModels() {
         const url = document.getElementById('ollamaUrl')?.value || localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
@@ -39,9 +60,13 @@ const app = {
         document.querySelectorAll('.nav-btn:not(.outline)').forEach(b => b.classList.remove('active'));
         event.currentTarget.classList.add('active');
     },
-    toggleSettings() {
+    async toggleSettings() {
         const m = document.getElementById('settingsModal');
-        m.style.display = m.style.display === 'none' ? 'flex' : 'none';
+        const isHidden = m.style.display === 'none' || !m.style.display;
+        m.style.display = isHidden ? 'flex' : 'none';
+        if (isHidden) {
+            await this.refreshOllamaModels();
+        }
     },
     async saveSettings() {
         const url = document.getElementById('ollamaUrl').value.trim() || 'http://localhost:11434';
