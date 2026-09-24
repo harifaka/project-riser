@@ -1,7 +1,8 @@
+import datetime
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from app import ChatAnalyzer, LLMService
+from app import ChatAnalyzer, LLMService, app
 
 
 class ChatAnalyzerTests(unittest.TestCase):
@@ -88,6 +89,55 @@ class ChatAnalyzerTests(unittest.TestCase):
             LLMService.resolve_ollama_url("http://localhost:11434"),
             "http://host.docker.internal:11434"
         )
+
+    @patch("app.Github")
+    def test_scan_github_lists_all_available_repos_in_order(self, mock_github):
+        repo_a = Mock(
+            id=2,
+            full_name="octo/alpha",
+            updated_at=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+            size=25,
+        )
+        repo_a.get_commits.return_value.totalCount = 0
+
+        repo_b = Mock(
+            id=1,
+            full_name="octo/beta",
+            updated_at=datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc),
+            size=5,
+        )
+        repo_b.get_commits.return_value.totalCount = 0
+
+        user = Mock()
+        user.get_repos.return_value = [repo_a, repo_b]
+        mock_github.return_value.get_user.return_value = user
+
+        with app.test_client() as client:
+            response = client.post(
+                "/api/github/scan",
+                json={
+                    "token": "abc123",
+                    "ollama_url": "http://localhost:11434",
+                    "ollama_model": "llama3.1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("repos", payload)
+        self.assertTrue(payload["scan_in_progress"])
+        self.assertEqual(len(payload["repos"]), 2)
+        self.assertEqual(payload["repos"][0]["full_name"], "octo/beta")
+        self.assertEqual(payload["repos"][1]["full_name"], "octo/alpha")
+        user.get_repos.assert_called_once_with(type="all", sort="updated", direction="desc")
+
+    @patch("app.requests.post")
+    def test_llm_ask_fails_safe_when_model_is_unavailable(self, mock_post):
+        mock_post.side_effect = Exception("LLM offline")
+
+        self.assertEqual(LLMService.ask("Analyze the developer's mood from these commits.", "http://localhost:11434", "llama3.1"), "DONE")
+        self.assertEqual(LLMService.ask("Estimate resurrection effort (S, M, L, XL)...", "http://localhost:11434", "llama3.1"), "M")
+        self.assertEqual(LLMService.ask("Write a 1-sentence summary of this code:", "http://localhost:11434", "llama3.1"), "No code extracted.")
 
 
 if __name__ == "__main__":

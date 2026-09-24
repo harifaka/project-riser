@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import datetime
+import threading
 import requests
 import re
 import io
@@ -48,6 +49,43 @@ class StateManager:
         self.repos = []
         self.stats = {"total_loc": 0, "abandoned_count": 0, "secrets_found": 0, "smells_found": 0}
         self.repo_cache = FIFOCache(capacity=5)
+        self.lock = threading.RLock()
+        self.scan_log = []
+        self.scan_in_progress = False
+        self.scan_started_at = None
+        self.scan_finished_at = None
+        self.scan_active_futures = set()
+
+    def reset_scan(self):
+        with self.lock:
+            self.repos = []
+            self.stats = {"total_loc": 0, "abandoned_count": 0, "secrets_found": 0, "smells_found": 0}
+            self.scan_log = []
+            self.scan_in_progress = True
+            self.scan_started_at = datetime.datetime.now(datetime.timezone.utc)
+            self.scan_finished_at = None
+            self.scan_active_futures.clear()
+
+    def track_future(self, future):
+        with self.lock:
+            self.scan_active_futures.add(future)
+
+        def _on_done(done_future):
+            with self.lock:
+                self.scan_active_futures.discard(done_future)
+                if not self.scan_active_futures:
+                    self.scan_in_progress = False
+                    self.scan_finished_at = datetime.datetime.now(datetime.timezone.utc)
+                    self.log("[repo-sync] background scan finished")
+
+        future.add_done_callback(_on_done)
+
+    def log(self, message):
+        print(message)
+        with self.lock:
+            self.scan_log.append({"time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "message": message})
+            if len(self.scan_log) > 200:
+                self.scan_log = self.scan_log[-200:]
 
 state = StateManager()
 executor = ThreadPoolExecutor(max_workers=4)
@@ -117,12 +155,43 @@ class LLMService:
             return ["llama3.1"]
 
     @staticmethod
+    def fallback_for_prompt(prompt):
+        lowered = (prompt or "").lower()
+        if "mood" in lowered or "feeling" in lowered:
+            return "DONE"
+        if "resurrection effort" in lowered or "effort" in lowered:
+            return "M"
+        if "summary" in lowered:
+            return "No code extracted."
+        return "Unavailable"
+
+    @staticmethod
     def ask(prompt, url, model):
-        if not url or not model: return "LLM not configured."
+        if not url or not model:
+            fallback = LLMService.fallback_for_prompt(prompt)
+            print(f"[llm-fallback] missing model config: {fallback}")
+            return fallback
         try:
-            res = requests.post(f"{url}/api/generate", json={"model": model, "prompt": prompt, "stream": False}, timeout=45).json()
-            return res.get("response", "").strip()
-        except: return "LLM Timeout or Error."
+            response = requests.post(
+                f"{url}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+                timeout=45,
+            )
+            if response.status_code != 200:
+                fallback = LLMService.fallback_for_prompt(prompt)
+                print(f"[llm-fallback] non-200 response ({response.status_code}): {fallback}")
+                return fallback
+            payload = response.json() or {}
+            result = str(payload.get("response", "")).strip()
+            if not result:
+                fallback = LLMService.fallback_for_prompt(prompt)
+                print(f"[llm-fallback] empty response: {fallback}")
+                return fallback
+            return result
+        except Exception:
+            fallback = LLMService.fallback_for_prompt(prompt)
+            print(f"[llm-fallback] offline/unavailable: {fallback}")
+            return fallback
 
 class ChatAnalyzer:
     @staticmethod
@@ -272,49 +341,63 @@ class RepoAnalyzer:
 
     def analyze(self, repo_data):
         name = repo_data['full_name']
+        state.log(f"[repo-sync] starting {name}")
         zip_content = self.fetch_zip(name)
-        if not zip_content: return
-        
+        if not zip_content:
+            state.log(f"[repo-sync] skipped {name}: zip unavailable")
+            return
+
         data = {"todos": [], "secrets": [], "env_vars": set(), "db_schemas": set(), "tech_stack": [], "custom_lines": 0, "smells": []}
         snippets = []
         sec_pat = re.compile(r"(?i)(api_key|secret|password|token)\s*[:=]\s*['\"][a-zA-Z0-9_\-]{10,}['\"]")
-        
+
         with zipfile.ZipFile(io.BytesIO(zip_content)) as z:
             for info in z.infolist():
-                if info.is_dir() or info.file_size > 500000 or "node_modules" in info.filename: continue
+                if info.is_dir() or info.file_size > 500000 or "node_modules" in info.filename:
+                    continue
                 fname = info.filename
                 if fname.endswith((".py", ".js", ".ts", ".rs", ".go")):
                     try:
                         content = z.read(info).decode('utf-8', errors='ignore')
                         lines = content.split('\n')
                         data["custom_lines"] += len(lines)
-                        if len(lines) > 1000: data["smells"].append(f"God File: {fname.split('/')[-1]}")
-                        for i, line in enumerate(lines):
-                            if "TODO:" in line or "FIXME:" in line: data["todos"].append(line.strip()[:60])
-                            if sec_pat.search(line): data["secrets"].append(fname.split('/')[-1])
-                        if len(snippets) < 2 and len(lines) > 15: snippets.append("\n".join(lines[:40]))
-                    except: pass
+                        if len(lines) > 1000:
+                            data["smells"].append(f"God File: {fname.split('/')[-1]}")
+                        for line in lines:
+                            if "TODO:" in line or "FIXME:" in line:
+                                data["todos"].append(line.strip()[:60])
+                            if sec_pat.search(line):
+                                data["secrets"].append(fname.split('/')[-1])
+                        if len(snippets) < 2 and len(lines) > 15:
+                            snippets.append("\n".join(lines[:40]))
+                    except Exception:
+                        pass
 
-        state.stats["total_loc"] += data["custom_lines"]
-        state.stats["secrets_found"] += len(data["secrets"])
-        state.stats["smells_found"] += len(data["smells"])
-
-        commits = "\n".join(repo_data['commits'])
+        commits = "\n".join(repo_data.get('commits', []))
         mood = LLMService.ask(f"Analyze the developer's mood from these commits. Are they FRUSTRATED, BORED, or DONE? Reply one word:\n{commits}", self.ollama_url, self.ollama_model)
         tshirt = LLMService.ask(f"Estimate resurrection effort (S, M, L, XL) based on {data['custom_lines']} lines of code and {len(data['todos'])} TODOs. Reply with one letter/word only.", self.ollama_url, self.ollama_model)
         desc = LLMService.ask(f"Write a 1-sentence summary of this code:\n{' '.join(snippets)}", self.ollama_url, self.ollama_model) if snippets else "No code extracted."
-        
-        days_abandoned = (datetime.datetime.now(datetime.timezone.utc) - repo_data['last_update']).days if repo_data['last_update'] else 0
-        abandon_score = min(100, int((days_abandoned / 365) * 100))
-        if abandon_score > 70: state.stats["abandoned_count"] += 1
 
-        profile = {
-            "id": repo_data['id'], "name": name, "description": desc, "mood": mood, "tshirt": tshirt,
-            "abandon_score": abandon_score, "days_abandoned": days_abandoned, "smells": data["smells"], 
-            "todos": data["todos"], "secrets": len(data["secrets"]), "tech_stack": list(set(data["tech_stack"])), 
-            "tags": {"backend": 0.9} 
-        }
-        state.repos.append(profile)
+        days_abandoned = (datetime.datetime.now(datetime.timezone.utc) - repo_data['last_update']).days if repo_data.get('last_update') else 0
+        abandon_score = min(100, int((days_abandoned / 365) * 100))
+
+        with state.lock:
+            state.stats["total_loc"] += data["custom_lines"]
+            state.stats["secrets_found"] += len(data["secrets"])
+            state.stats["smells_found"] += len(data["smells"])
+            if abandon_score > 70:
+                state.stats["abandoned_count"] += 1
+
+            profile = {
+                "id": repo_data['id'], "name": name, "description": desc, "mood": mood, "tshirt": tshirt,
+                "abandon_score": abandon_score, "days_abandoned": days_abandoned, "smells": data["smells"],
+                "todos": data["todos"], "secrets": len(data["secrets"]), "tech_stack": list(set(data["tech_stack"])),
+                "tags": {"backend": 0.9}, "updated_at": repo_data.get('last_update')
+            }
+            state.repos.append(profile)
+            state.repos.sort(key=lambda r: (r.get('updated_at') or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(r.get('name', ''))), reverse=True)
+
+        state.log(f"[repo-sync] complete {name}: loc={data['custom_lines']}, mood={mood}, effort={tshirt}, abandoned_days={days_abandoned}")
 
 class TimeTravelService:
     @staticmethod
@@ -374,10 +457,19 @@ Based on the code state and the past AI conversation, please provide:
 def index(): return render_template('index.html')
 
 @app.route('/api/stats', methods=['GET'])
-def get_stats(): return jsonify(state.stats)
+def get_stats():
+    with state.lock:
+        payload = dict(state.stats)
+        payload["scan_in_progress"] = state.scan_in_progress
+        payload["scan_started_at"] = state.scan_started_at.isoformat() if state.scan_started_at else None
+        payload["scan_finished_at"] = state.scan_finished_at.isoformat() if state.scan_finished_at else None
+        return jsonify(payload)
 
 @app.route('/api/repos', methods=['GET'])
-def get_repos(): return jsonify({"repos": state.repos})
+def get_repos():
+    with state.lock:
+        ordered = sorted(state.repos, key=lambda r: (r.get('updated_at') or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(r.get('name', ''))), reverse=True)
+        return jsonify({"repos": ordered, "scan_in_progress": state.scan_in_progress})
 
 @app.route('/api/analytics', methods=['GET'])
 def get_analytics():
@@ -486,17 +578,54 @@ def upload_chats():
 
 @app.route('/api/github/scan', methods=['POST'])
 def scan_github():
-    data = request.json
-    g = Github(data.get("token"))
+    payload = request.get_json(silent=True) or {}
+    token = payload.get("token")
+    if not token:
+        return jsonify({"error": "GitHub token is required."}), 400
+
     try:
-        repos = g.get_user().get_repos(type="owner", sort="updated", direction="desc")[:8]
-        state.repos = []
-        analyzer = RepoAnalyzer(data.get("token"), data.get("ollama_url"), data.get("ollama_model"))
-        for r in repos:
-            meta = {"id": r.id, "full_name": r.full_name, "last_update": r.updated_at, "commits": [c.commit.message for c in r.get_commits()[:5]] if r.get_commits().totalCount > 0 else []}
-            executor.submit(analyzer.analyze, meta)
-        return jsonify({"status": "started"})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        g = Github(token)
+        user = g.get_user()
+        repos = list(user.get_repos(type="all", sort="updated", direction="desc"))
+        ordered = sorted(repos, key=lambda r: (r.updated_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), r.full_name.lower()), reverse=True)
+
+        state.reset_scan()
+        state.log(f"[repo-sync] discovered {len(ordered)} repos via GitHub token; beginning in-memory sync")
+
+        analyzer = RepoAnalyzer(token, payload.get("ollama_url"), payload.get("ollama_model"))
+        for r in ordered:
+            try:
+                commits = []
+                commit_list = list(r.get_commits()[:5])
+                for commit in commit_list:
+                    message = getattr(getattr(commit, 'commit', None), 'message', None)
+                    if message:
+                        commits.append(message)
+            except Exception as exc:
+                state.log(f"[repo-sync] commit fetch failed for {r.full_name}: {exc}")
+                commits = []
+
+            meta = {
+                "id": r.id,
+                "full_name": r.full_name,
+                "name": getattr(r, 'name', r.full_name),
+                "last_update": r.updated_at,
+                "updated_at": r.updated_at,
+                "commits": commits,
+                "size": getattr(r, 'size', 0),
+            }
+            state.log(f"[repo-sync] queued {r.full_name} updated={r.updated_at}")
+            future = executor.submit(analyzer.analyze, meta)
+            state.track_future(future)
+
+        return jsonify({
+            "status": "started",
+            "scan_in_progress": True,
+            "repos": [{"id": r.id, "full_name": r.full_name, "updated_at": r.updated_at.isoformat() if r.updated_at else None, "size": getattr(r, 'size', 0)} for r in ordered],
+        })
+    except Exception as e:
+        state.log(f"[repo-sync] fatal error: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
 
 @app.route('/api/time_travel/<repo_id>', methods=['POST'])
 def time_travel(repo_id):
