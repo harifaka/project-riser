@@ -2,6 +2,7 @@
 import json
 import uuid
 import datetime
+import hashlib
 import threading
 import requests
 import re
@@ -51,6 +52,26 @@ class FIFOCache:
             self.cache.popitem(last=False)
 
 
+class ConcurrencyGate:
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._active = 0
+
+    def __enter__(self):
+        with self._cond:
+            limit = max(1, int(state.settings.get('chunk_size', 5))) if 'state' in globals() else 5
+            while self._active >= limit:
+                self._cond.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify()
+        return False
+
+
 class StateManager:
     DEFAULT_TAGS = [
         {"id": "backend", "name": "backend", "color": "#22c55e"},
@@ -77,12 +98,22 @@ class StateManager:
         self.scan_started_at = None
         self.scan_finished_at = None
         self.scan_active_futures = set()
+        self.scan_generation = 0
+        self.chat_retag_generation = 0
+        self.chat_retag_in_progress = False
+        self.chat_retag_done = 0
+        self.chat_retag_total = 0
+        self._dirty_writes = 0
+        self._save_timer = None
+        self.work_gate = ConcurrencyGate()
+        self._laya_backend_logged = None
         self.settings = {
             "cache_size": 5,
             "description_word_budget": 18,
             "chunk_size": 5,
             "confidence": 70,
             "laya_backend": "auto",
+            "laya_model": "facebook/bart-large-mnli",
             "ollama_url": "http://localhost:11434",
             "ollama_model": "llama3.1",
         }
@@ -99,28 +130,55 @@ class StateManager:
                     self.repos = payload.get('repos', []) or []
                     stats = payload.get('stats', {}) or {}
                     self.stats = {"total_loc": int(stats.get('total_loc', 0)), "abandoned_count": int(stats.get('abandoned_count', 0)), "secrets_found": int(stats.get('secrets_found', 0)), "smells_found": int(stats.get('smells_found', 0))}
-                    self.scan_in_progress = bool(payload.get('scan_in_progress', False))
+                    self.scan_in_progress = False
                     self.scan_started_at = datetime.datetime.fromisoformat(payload['scan_started_at']) if payload.get('scan_started_at') else None
                     self.scan_finished_at = datetime.datetime.fromisoformat(payload['scan_finished_at']) if payload.get('scan_finished_at') else None
+                    self.recompute_stats()
             except Exception:
                 self.repos = []
                 self.stats = {"total_loc": 0, "abandoned_count": 0, "secrets_found": 0, "smells_found": 0}
 
+    def _scan_payload(self):
+        safe_repos = []
+        for repo in self.repos:
+            record = dict(repo)
+            record.pop('commits', None)
+            safe_repos.append(self._json_safe(record))
+        return {
+            'repos': safe_repos,
+            'stats': self._json_safe(self.stats),
+            'scan_in_progress': self.scan_in_progress,
+            'scan_started_at': self.scan_started_at.isoformat() if self.scan_started_at else None,
+            'scan_finished_at': self.scan_finished_at.isoformat() if self.scan_finished_at else None,
+        }
+
     def save_scan_cache(self):
+        self.flush_scan_cache()
+
+    def flush_scan_cache(self):
         with self.lock:
-            safe_repos = []
-            for repo in self.repos:
-                record = dict(repo)
-                record.pop('commits', None)
-                safe_repos.append(self._json_safe(record))
-            payload = {
-                'repos': safe_repos,
-                'stats': self._json_safe(self.stats),
-                'scan_in_progress': self.scan_in_progress,
-                'scan_started_at': self.scan_started_at.isoformat() if self.scan_started_at else None,
-                'scan_finished_at': self.scan_finished_at.isoformat() if self.scan_finished_at else None,
-            }
-            SCAN_CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
+            self._dirty_writes = 0
+            payload = self._scan_payload()
+        SCAN_CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+    def note_scan_dirty(self):
+        with self.lock:
+            self._dirty_writes += 1
+            if self._dirty_writes >= 5:
+                self._dirty_writes = 0
+                if self._save_timer is not None:
+                    self._save_timer.cancel()
+                    self._save_timer = None
+                return True
+            if self._save_timer is None:
+                timer = threading.Timer(2.0, self.flush_scan_cache)
+                timer.daemon = True
+                self._save_timer = timer
+                timer.start()
+            return False
 
     def load_tag_cache(self):
         with self.lock:
@@ -165,27 +223,67 @@ class StateManager:
     def get_tag_names(self):
         return [str(tag.get('name', tag.get('id', ''))).strip() for tag in self.tags if tag.get('name') or tag.get('id')]
 
-    def reset_scan(self):
+    def tag_fingerprint(self):
+        names = sorted(name.lower() for name in self.get_tag_names())
+        return hashlib.sha256('|'.join(names).encode('utf-8')).hexdigest()[:16]
+
+    def recompute_stats(self):
+        loc = 0
+        abandoned = 0
+        secrets = 0
+        smells = 0
+        for repo in self.repos:
+            if repo.get('custom_lines') is None and repo.get('status') != 'ready':
+                continue
+            loc += int(repo.get('custom_lines') or 0)
+            if repo.get('abandon_score') is not None and int(repo.get('abandon_score') or 0) > 70:
+                abandoned += 1
+            secrets += int(repo.get('secrets') or 0)
+            smells += len(repo.get('smells') or [])
+        self.stats = {
+            'total_loc': loc,
+            'abandoned_count': abandoned,
+            'secrets_found': secrets,
+            'smells_found': smells,
+        }
+
+    def start_scan_generation(self):
         with self.lock:
-            self.repos = []
-            self.stats = {"total_loc": 0, "abandoned_count": 0, "secrets_found": 0, "smells_found": 0}
+            self.scan_generation += 1
             self.scan_log = []
             self.scan_in_progress = True
             self.scan_started_at = datetime.datetime.now(datetime.timezone.utc)
             self.scan_finished_at = None
             self.scan_active_futures.clear()
+            return self.scan_generation
 
-    def track_future(self, future):
+    def is_current_scan(self, generation):
         with self.lock:
+            return generation == self.scan_generation
+
+    def reset_scan(self):
+        self.start_scan_generation()
+
+    def track_future(self, future, generation=None):
+        with self.lock:
+            if generation is not None and generation != self.scan_generation:
+                return
             self.scan_active_futures.add(future)
 
         def _on_done(done_future):
+            finish = False
             with self.lock:
                 self.scan_active_futures.discard(done_future)
+                if generation is not None and generation != self.scan_generation:
+                    return
                 if not self.scan_active_futures:
                     self.scan_in_progress = False
                     self.scan_finished_at = datetime.datetime.now(datetime.timezone.utc)
-                    self.log("[repo-sync] background scan finished")
+                    self.recompute_stats()
+                    finish = True
+            if finish:
+                self.log('[repo-sync] background scan finished')
+                self.flush_scan_cache()
 
         future.add_done_callback(_on_done)
 
@@ -195,6 +293,153 @@ class StateManager:
             self.scan_log.append({"time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "message": message})
             if len(self.scan_log) > 200:
                 self.scan_log = self.scan_log[-200:]
+
+
+def coerce_datetime(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
+    return None
+
+
+def content_fingerprint(repo_id, pushed_at, size):
+    stamp = ''
+    moment = coerce_datetime(pushed_at)
+    if moment is not None:
+        stamp = moment.isoformat()
+    raw = f'{repo_id}|{stamp}|{size}'
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+
+def pushed_at_of(repo):
+    pushed = getattr(repo, 'pushed_at', None)
+    if isinstance(pushed, datetime.datetime):
+        return pushed
+    updated = getattr(repo, 'updated_at', None)
+    if isinstance(updated, datetime.datetime):
+        return updated
+    return None
+
+
+def repo_sort_key(repo):
+    updated = coerce_datetime(repo.get('updated_at') or repo.get('last_update')) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    return (updated, str(repo.get('name') or ''))
+
+
+def public_repo(repo):
+    record = StateManager._json_safe(dict(repo))
+    record.pop('commits', None)
+    record['manual_tags'] = list(state.tag_assignments.get('repos', {}).get(str(repo.get('id')), []) or [])
+    return record
+
+
+def scan_status_payload():
+    with state.lock:
+        ordered = sorted(state.repos, key=repo_sort_key, reverse=True)
+        total = len(ordered)
+        analyzed = sum(1 for repo in ordered if repo.get('status') in ('ready', 'error'))
+        cached = sum(1 for repo in ordered if repo.get('cache_hit') and repo.get('status') == 'ready')
+        return {
+            'status': 'started' if state.scan_in_progress else 'idle',
+            'scan_in_progress': state.scan_in_progress,
+            'repo_count': total,
+            'total_count': total,
+            'analyzed_count': analyzed,
+            'cached_count': cached,
+            'repos': [public_repo(repo) for repo in ordered],
+            'scan_log': list(state.scan_log[-40:]),
+        }
+
+
+def confidence_ratio():
+    return max(0.0, min(1.0, float(state.settings.get('confidence', 70)) / 100.0))
+
+
+def chat_matches_tag(chat, tag):
+    manual = set(state.tag_assignments.get('chats', {}).get(str(chat.get('id')), []) or [])
+    if tag.get('id') in manual or tag.get('name') in manual:
+        return True
+    scores = chat.get('tags') or {}
+    score = scores.get(tag.get('name'), scores.get(tag.get('id'), 0))
+    try:
+        return float(score) >= confidence_ratio()
+    except (TypeError, ValueError):
+        return False
+
+
+def chat_overview_payload():
+    with state.lock:
+        threshold = confidence_ratio()
+        day_counts = {}
+        dated = 0
+        sources = {}
+        closures = {}
+        tag_counts = []
+        items = []
+        for chat in state.conversations:
+            source = chat.get('source') or 'Unknown'
+            sources[source] = sources.get(source, 0) + 1
+            closure = chat.get('closure_reason') or 'TIMEOUT'
+            closures[closure] = closures.get(closure, 0) + 1
+            day = chat.get('created_on')
+            if day:
+                dated += 1
+                day_counts[day] = day_counts.get(day, 0) + 1
+            visible = [tag.get('name') for tag in state.tags if chat_matches_tag(chat, tag)]
+            items.append({
+                'id': chat.get('id'),
+                'title': chat.get('title'),
+                'source': source,
+                'created_on': day,
+                'summary': chat.get('summary'),
+                'closure_reason': closure,
+                'tags': visible,
+                'manual_tags': list(state.tag_assignments.get('chats', {}).get(str(chat.get('id')), []) or []),
+            })
+        for tag in state.tags:
+            tag_counts.append({
+                'id': tag.get('id'),
+                'name': tag.get('name'),
+                'color': tag.get('color'),
+                'count': sum(1 for chat in state.conversations if chat_matches_tag(chat, tag)),
+            })
+        heatmap = []
+        if day_counts:
+            start = datetime.date.fromisoformat(min(day_counts))
+            end = datetime.date.fromisoformat(max(day_counts))
+            cursor = start
+            while cursor <= end:
+                key = cursor.isoformat()
+                heatmap.append({'date': key, 'count': day_counts.get(key, 0)})
+                cursor += datetime.timedelta(days=1)
+        total = len(state.conversations)
+        done = state.chat_retag_done
+        return {
+            'total': total,
+            'dated': dated,
+            'undated': total - dated,
+            'sources': sources,
+            'closures': closures,
+            'heatmap': heatmap,
+            'tag_counts': tag_counts,
+            'chats': items,
+            'confidence': state.settings.get('confidence', 70),
+            'threshold': threshold,
+            'retag_in_progress': state.chat_retag_in_progress,
+            'retag_done': done,
+            'retag_total': state.chat_retag_total,
+        }
 
 
 state = StateManager()
@@ -348,12 +593,109 @@ class LLMService:
 
 
 class LayaDecisionService:
-    def __init__(self, backend='auto'):
-        self.backend = backend or 'auto'
+    _pipeline = None
+    _pipeline_model = None
+    _pipeline_lock = threading.Lock()
+
+    def __init__(self, backend=None):
+        self.backend = backend
 
     def score(self, text, labels=None):
         labels = labels or state.get_tag_names() or ['backend', 'frontend', 'debugging']
+        labels = [str(label).strip() for label in labels if str(label).strip()]
+        if not labels:
+            return {}
+        chosen = self._resolve_backend()
+        if state._laya_backend_logged != chosen:
+            state._laya_backend_logged = chosen
+            state.log(f'[laya] using {chosen}')
+        if chosen == 'transformers':
+            scored = self._score_transformers(text, labels)
+            if scored is not None:
+                return scored
+            if (self.backend or state.settings.get('laya_backend') or 'auto') != 'transformers':
+                scored = self._score_ollama(text, labels)
+                if scored is not None:
+                    return scored
+        elif chosen == 'ollama':
+            scored = self._score_ollama(text, labels)
+            if scored is not None:
+                return scored
         return LLMService.laya_scores_for_text(text, labels)
+
+    def _resolve_backend(self):
+        backend = (self.backend or state.settings.get('laya_backend') or 'auto').strip().lower()
+        if backend == 'keyword':
+            return 'keyword'
+        if backend == 'ollama':
+            return 'ollama'
+        if backend == 'transformers':
+            return 'transformers'
+        if self._transformers_available():
+            return 'transformers'
+        if state.settings.get('ollama_url') and state.settings.get('ollama_model'):
+            return 'ollama'
+        return 'keyword'
+
+    @classmethod
+    def _transformers_available(cls):
+        try:
+            import transformers  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _score_transformers(cls, text, labels):
+        model_id = state.settings.get('laya_model') or 'facebook/bart-large-mnli'
+        try:
+            with cls._pipeline_lock:
+                if cls._pipeline is None or cls._pipeline_model != model_id:
+                    from transformers import pipeline
+                    cls._pipeline = pipeline('zero-shot-classification', model=model_id)
+                    cls._pipeline_model = model_id
+                classifier = cls._pipeline
+            result = classifier((text or '')[:2000], candidate_labels=labels, multi_label=True)
+            names = result.get('labels') or []
+            scores = result.get('scores') or []
+            ordered = {str(name): round(float(score), 3) for name, score in zip(names, scores) if float(score) > 0}
+            return ordered
+        except Exception as exc:
+            state.log(f'[laya] transformers unavailable: {exc}')
+            cls._pipeline = None
+            cls._pipeline_model = None
+            return None
+
+    @staticmethod
+    def _score_ollama(text, labels):
+        label_list = ', '.join(labels)
+        prompt = (
+            'Score each label from 0 to 1 for how well it fits the text. '
+            'Reply with a JSON object only, keys exactly the labels, values numbers.\n'
+            f'Labels: {label_list}\nText:\n{(text or "")[:2000]}'
+        )
+        raw = LLMService.ask(prompt, state.settings.get('ollama_url'), state.settings.get('ollama_model'))
+        if not raw or raw in ('Unavailable', 'No code extracted.', 'DONE', 'M'):
+            return None
+        match = re.search(r'\{.*\}', raw, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        scored = {}
+        for label in labels:
+            value = payload.get(label, payload.get(label.lower()))
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                scored[label] = round(min(1.0, max(0.0, number)), 3)
+        return scored or None
 
 
 class ChatAnalyzer:
@@ -414,6 +756,29 @@ class ChatAnalyzer:
         return [p for p in parts if p]
 
     @staticmethod
+    def _coerce_day(value):
+        if value is None or value == '':
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if re.fullmatch(r'\d+(\.\d+)?', text):
+                return ChatAnalyzer._coerce_day(float(text))
+            try:
+                parsed = datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
+                return parsed.date().isoformat()
+            except ValueError:
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+                return match.group(1) if match else None
+        return None
+
+    @staticmethod
     def _extract_from_json(data):
         found = []
         if isinstance(data, list):
@@ -421,7 +786,12 @@ class ChatAnalyzer:
                 found.extend(ChatAnalyzer._extract_from_json(item))
         elif isinstance(data, dict):
             if 'mapping' in data:
-                found.append({'title': data.get('title', 'Imported Chat'), 'source': 'ChatGPT', 'text_parts': ChatAnalyzer._extract_from_mapping(data.get('mapping'))})
+                found.append({
+                    'title': data.get('title', 'Imported Chat'),
+                    'source': 'ChatGPT',
+                    'text_parts': ChatAnalyzer._extract_from_mapping(data.get('mapping')),
+                    'created_on': ChatAnalyzer._coerce_day(data.get('create_time') or data.get('update_time')),
+                })
             elif 'messages' in data:
                 text_parts = []
                 for msg in data.get('messages', []):
@@ -436,11 +806,21 @@ class ChatAnalyzer:
                                 elif isinstance(value, list):
                                     text_parts.extend([str(v) for v in value if isinstance(v, str)])
                 if text_parts:
-                    found.append({'title': data.get('title', 'Imported Chat'), 'source': 'Gemini', 'text_parts': text_parts})
+                    found.append({
+                        'title': data.get('title', 'Imported Chat'),
+                        'source': 'Gemini',
+                        'text_parts': text_parts,
+                        'created_on': ChatAnalyzer._coerce_day(data.get('update_time') or data.get('updateTime') or data.get('timestamp') or data.get('create_time')),
+                    })
             else:
                 for key in ('title', 'text', 'content', 'prompt', 'response', 'value'):
                     if key in data and isinstance(data[key], str):
-                        found.append({'title': data.get('title', 'Imported Chat'), 'source': 'Gemini', 'text_parts': [data[key]]})
+                        found.append({
+                            'title': data.get('title', 'Imported Chat'),
+                            'source': 'Gemini',
+                            'text_parts': [data[key]],
+                            'created_on': ChatAnalyzer._coerce_day(data.get('update_time') or data.get('updateTime') or data.get('timestamp') or data.get('create_time')),
+                        })
                         break
                 if not found:
                     if 'conversations' in data:
@@ -465,10 +845,10 @@ class ChatAnalyzer:
         if not parsed_entries and ('<html' in raw_text.lower() or '<div' in raw_text.lower() or '<p' in raw_text.lower()):
             title = re.search(r'(?is)<title\b[^>]*>(.*?)</title>', raw_text)
             title_text = ChatAnalyzer._clean_text(title.group(1)) if title else 'Gemini Export'
-            parsed_entries = [{'title': title_text, 'source': 'Gemini', 'text_parts': ChatAnalyzer._extract_html_text(raw_text)}]
+            parsed_entries = [{'title': title_text, 'source': 'Gemini', 'text_parts': ChatAnalyzer._extract_html_text(raw_text), 'created_on': None}]
 
         if not parsed_entries:
-            parsed_entries = [{'title': 'Imported Chat', 'source': 'Gemini', 'text_parts': [raw_text[:4000]]}]
+            parsed_entries = [{'title': 'Imported Chat', 'source': 'Gemini', 'text_parts': [raw_text[:4000]], 'created_on': None}]
 
         for conv in parsed_entries:
             text_parts = conv.get('text_parts', [])
@@ -484,8 +864,6 @@ class ChatAnalyzer:
                 closure = 'TIMEOUT'
             summary = LLMService.clamp_description(full_text, state.settings.get('description_word_budget', 18))
             tags = LayaDecisionService().score(full_text)
-            if not tags:
-                tags = {'backend': 0.8}
             extracted.append({
                 'id': str(uuid.uuid4()),
                 'title': title,
@@ -493,6 +871,7 @@ class ChatAnalyzer:
                 'text': full_text[:3000],
                 'summary': summary,
                 'closure_reason': closure,
+                'created_on': conv.get('created_on'),
                 'tags': tags,
             })
         return extracted
@@ -500,9 +879,23 @@ class ChatAnalyzer:
 
 class RepoAnalyzer:
     def __init__(self, token, ollama_url, ollama_model):
+        self.token = token
         self.headers = {'Authorization': f'token {token}'}
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model
+
+    def _recent_commits(self, repo_name):
+        try:
+            repo = Github(self.token).get_repo(repo_name)
+            messages = []
+            for commit in list(repo.get_commits()[:5]):
+                message = getattr(getattr(commit, 'commit', None), 'message', None)
+                if message:
+                    messages.append(message)
+            return messages
+        except Exception as exc:
+            state.log(f'[repo-sync] commit fetch failed for {repo_name}: {exc}')
+            return []
 
     def fetch_zip(self, repo_name):
         cached = state.repo_cache.get(repo_name)
@@ -544,13 +937,45 @@ class RepoAnalyzer:
                     stack.add('api')
         return sorted(stack)
 
-    def analyze(self, repo_data):
+    def analyze(self, repo_data, generation=None):
         name = repo_data['full_name']
-        state.log(f'[repo-sync] starting {name}')
-        zip_content = self.fetch_zip(name)
-        if not zip_content:
-            state.log(f'[repo-sync] skipped {name}: zip unavailable')
-            return
+        with state.work_gate:
+            try:
+                if generation is not None and not state.is_current_scan(generation):
+                    return
+                with state.lock:
+                    if generation is not None and generation != state.scan_generation:
+                        return
+                    match = next((repo for repo in state.repos if str(repo.get('id')) == str(repo_data.get('id'))), None)
+                    if match is not None:
+                        match['status'] = 'analyzing'
+                state.log(f'[repo-sync] starting {name}')
+                repo_data['commits'] = self._recent_commits(name)
+                zip_content = self.fetch_zip(name)
+                if not zip_content:
+                    state.log(f'[repo-sync] skipped {name}: zip unavailable')
+                    self._finish_repo(repo_data, generation, {'status': 'error', 'description': repo_data.get('description') or 'ZIP unavailable'})
+                    return
+                self._analyze_zip(repo_data, generation, name, zip_content)
+            except Exception as exc:
+                state.log(f'[repo-sync] failed {name}: {exc}')
+                self._finish_repo(repo_data, generation, {'status': 'error', 'description': 'Analysis failed'})
+
+    def _finish_repo(self, repo_data, generation, fields):
+        flush_now = False
+        with state.lock:
+            if generation is not None and generation != state.scan_generation:
+                return
+            repo_match = next((repo for repo in state.repos if str(repo.get('id')) == str(repo_data.get('id'))), None)
+            if repo_match is None:
+                return
+            repo_match.update(fields)
+            state.recompute_stats()
+            flush_now = state.note_scan_dirty()
+        if flush_now:
+            state.flush_scan_cache()
+
+    def _analyze_zip(self, repo_data, generation, name, zip_content):
 
         data = {'todos': [], 'secrets': [], 'env_vars': set(), 'db_schemas': set(), 'tech_stack': [], 'custom_lines': 0, 'smells': [], 'endpoints': []}
         snippets = []
@@ -603,45 +1028,37 @@ class RepoAnalyzer:
         desc = LLMService.ask(f"Write a summary of at most {state.settings.get('description_word_budget', 18)} words of this code:\n{' '.join(snippets)}", self.ollama_url, self.ollama_model) if snippets else 'No code extracted.'
         desc = LLMService.clamp_description(desc, state.settings.get('description_word_budget', 18))
 
-        days_abandoned = (datetime.datetime.now(datetime.timezone.utc) - repo_data['last_update']).days if repo_data.get('last_update') else 0
+        last_update = coerce_datetime(repo_data.get('last_update'))
+        days_abandoned = (datetime.datetime.now(datetime.timezone.utc) - last_update).days if last_update else 0
         abandon_score = min(100, max(0, int((days_abandoned / 365) * 60 + (len(data['todos']) * 5) + (len(data['smells']) * 2))))
         tags = LayaDecisionService().score(' '.join(snippets) or name)
+        if generation is not None and not state.is_current_scan(generation):
+            return
 
-        with state.lock:
-            state.stats['total_loc'] += data['custom_lines']
-            state.stats['secrets_found'] += len(data['secrets'])
-            state.stats['smells_found'] += len(data['smells'])
-            if abandon_score > 70:
-                state.stats['abandoned_count'] += 1
-
-            repo_match = next((repo for repo in state.repos if str(repo.get('id')) == str(repo_data['id'])), None)
-            if repo_match is None:
-                repo_match = {'id': repo_data['id'], 'name': name, 'full_name': name, 'status': 'ready'}
-                state.repos.append(repo_match)
-
-            repo_match.update({
-                'id': repo_data['id'],
-                'name': name,
-                'full_name': name,
-                'description': desc,
-                'mood': mood,
-                'tshirt': tshirt,
-                'abandon_score': abandon_score,
-                'days_abandoned': days_abandoned,
-                'smells': data['smells'],
-                'todos': data['todos'],
-                'secrets': len(data['secrets']),
-                'tech_stack': sorted(set(data['tech_stack'] + list(self._detect_tech_stack(zip_content)))),
-                'env_vars': sorted(data['env_vars']),
-                'db_schemas': sorted(data['db_schemas']),
-                'endpoints': data['endpoints'],
-                'updated_at': repo_data.get('last_update'),
-                'status': 'ready',
-                'tags': tags,
-            })
-            state.repos.sort(key=lambda r: (r.get('updated_at') or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(r.get('name', ''))), reverse=True)
-            state.save_scan_cache()
-
+        self._finish_repo(repo_data, generation, {
+            'id': repo_data['id'],
+            'name': name,
+            'full_name': name,
+            'description': desc,
+            'mood': mood,
+            'tshirt': tshirt,
+            'abandon_score': abandon_score,
+            'days_abandoned': days_abandoned,
+            'custom_lines': data['custom_lines'],
+            'smells': data['smells'],
+            'todos': data['todos'],
+            'secrets': len(data['secrets']),
+            'tech_stack': sorted(set(data['tech_stack'] + list(self._detect_tech_stack(zip_content)))),
+            'env_vars': sorted(data['env_vars']),
+            'db_schemas': sorted(data['db_schemas']),
+            'endpoints': data['endpoints'],
+            'updated_at': repo_data.get('last_update'),
+            'status': 'ready',
+            'tags': tags,
+            'content_hash': repo_data.get('content_hash'),
+            'tag_fingerprint': state.tag_fingerprint(),
+            'cache_hit': False,
+        })
         state.log(f"[repo-sync] complete {name}: loc={data['custom_lines']}, mood={mood}, effort={tshirt}, abandoned_days={days_abandoned}")
 
 
@@ -723,23 +1140,18 @@ def index():
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     with state.lock:
+        state.recompute_stats()
         payload = dict(state.stats)
         payload['scan_in_progress'] = state.scan_in_progress
         payload['scan_started_at'] = state.scan_started_at.isoformat() if state.scan_started_at else None
         payload['scan_finished_at'] = state.scan_finished_at.isoformat() if state.scan_finished_at else None
+        payload['scan_log'] = list(state.scan_log[-40:])
         return jsonify(payload)
 
 
 @app.route('/api/repos', methods=['GET'])
 def get_repos():
-    with state.lock:
-        ordered = sorted(state.repos, key=lambda r: (r.get('updated_at') or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(r.get('name', ''))), reverse=True)
-        return jsonify({
-            'repos': ordered,
-            'scan_in_progress': state.scan_in_progress,
-            'total_count': len(ordered),
-            'analyzed_count': sum(1 for r in ordered if r.get('status') == 'ready'),
-        })
+    return jsonify(scan_status_payload())
 
 
 @app.route('/api/analytics', methods=['GET'])
@@ -792,8 +1204,10 @@ def get_analytics():
     })
 
 
-@app.route('/api/settings', methods=['POST'])
+@app.route('/api/settings', methods=['GET', 'POST'])
 def update_settings():
+    if request.method == 'GET':
+        return jsonify({'settings': state.settings, 'tags': state.tags})
     payload = request.get_json(silent=True) or {}
     if 'cache_size' in payload:
         state.settings['cache_size'] = max(5, min(20, int(payload.get('cache_size', state.settings['cache_size']))))
@@ -805,7 +1219,17 @@ def update_settings():
     if 'confidence' in payload:
         state.settings['confidence'] = max(0, min(100, int(payload.get('confidence', state.settings['confidence']))))
     if 'laya_backend' in payload:
-        state.settings['laya_backend'] = str(payload.get('laya_backend', state.settings['laya_backend']))
+        backend = str(payload.get('laya_backend', state.settings['laya_backend'])).strip().lower()
+        if backend not in ('auto', 'transformers', 'ollama', 'keyword'):
+            backend = 'auto'
+        state.settings['laya_backend'] = backend
+        state._laya_backend_logged = None
+    if 'laya_model' in payload:
+        model_id = str(payload.get('laya_model') or '').strip()
+        if model_id:
+            state.settings['laya_model'] = model_id
+            LayaDecisionService._pipeline = None
+            LayaDecisionService._pipeline_model = None
     if 'ollama_url' in payload:
         state.settings['ollama_url'] = str(payload.get('ollama_url', state.settings['ollama_url']))
     if 'ollama_model' in payload:
@@ -870,59 +1294,84 @@ def scan_github():
         repos = list(user.get_repos(type='all', sort='updated', direction='desc'))
         ordered = sorted(repos, key=lambda r: (r.updated_at or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), r.full_name.lower()), reverse=True)
 
-        state.reset_scan()
+        generation = state.start_scan_generation()
         state.log(f'[repo-sync] discovered {len(ordered)} repos via GitHub token; beginning in-memory sync')
 
         analyzer = RepoAnalyzer(token, payload.get('ollama_url'), payload.get('ollama_model'))
+        tag_fp = state.tag_fingerprint()
+        previous = {str(repo.get('id')): repo for repo in state.repos}
+        profiles = []
+        dirty = []
         for r in ordered:
-            try:
-                commit_messages = []
-                for commit in list(r.get_commits()[:5]):
-                    message = getattr(getattr(commit, 'commit', None), 'message', None)
-                    if message:
-                        commit_messages.append(message)
-            except Exception as exc:
-                state.log(f'[repo-sync] commit fetch failed for {r.full_name}: {exc}')
-                commit_messages = []
-
             raw_name = getattr(r, 'name', None)
             repo_name = raw_name if isinstance(raw_name, str) and raw_name.strip() else r.full_name
             raw_description = getattr(r, 'description', None)
             repo_description = raw_description if isinstance(raw_description, str) else ''
-            profile = {
-                'id': r.id,
-                'full_name': r.full_name,
-                'name': repo_name,
-                'description': repo_description or 'GitHub repository',
-                'last_update': r.updated_at,
-                'updated_at': r.updated_at,
-                'commits': commit_messages,
-                'size': getattr(r, 'size', 0),
-                'status': 'pending',
-                'tags': {},
-            }
-            state.repos.append(profile)
-            state.save_scan_cache()
-            future = executor.submit(analyzer.analyze, profile)
-            state.track_future(future)
-
-        return jsonify({
-            'status': 'started',
-            'scan_in_progress': True,
-            'repo_count': len(state.repos),
-            'repos': [
-                {
-                    'id': r.get('id'),
-                    'full_name': r.get('full_name'),
-                    'name': r.get('name'),
-                    'description': r.get('description'),
-                    'updated_at': r.get('updated_at').isoformat() if r.get('updated_at') else None,
-                    'status': r.get('status', 'pending'),
-                    'size': r.get('size', 0),
+            size = getattr(r, 'size', 0)
+            if not isinstance(size, int):
+                size = 0
+            pushed = pushed_at_of(r)
+            fingerprint = content_fingerprint(r.id, pushed, size)
+            cached = previous.get(str(r.id))
+            cache_hit = bool(
+                cached
+                and cached.get('status') == 'ready'
+                and cached.get('content_hash') == fingerprint
+                and cached.get('tag_fingerprint') == tag_fp
+            )
+            if cache_hit:
+                profile = dict(cached)
+                profile.update({
+                    'full_name': r.full_name,
+                    'name': repo_name,
+                    'updated_at': r.updated_at,
+                    'last_update': r.updated_at,
+                    'size': size,
+                    'status': 'ready',
+                    'content_hash': fingerprint,
+                    'tag_fingerprint': tag_fp,
+                    'cache_hit': True,
+                })
+            else:
+                profile = {
+                    'id': r.id,
+                    'full_name': r.full_name,
+                    'name': repo_name,
+                    'description': (cached or {}).get('description') or repo_description or 'GitHub repository',
+                    'last_update': r.updated_at,
+                    'updated_at': r.updated_at,
+                    'size': size,
+                    'status': 'pending',
+                    'tags': (cached or {}).get('tags') or {},
+                    'content_hash': fingerprint,
+                    'tag_fingerprint': tag_fp,
+                    'cache_hit': False,
+                    'custom_lines': (cached or {}).get('custom_lines'),
+                    'abandon_score': (cached or {}).get('abandon_score'),
+                    'secrets': (cached or {}).get('secrets'),
+                    'smells': (cached or {}).get('smells'),
+                    'mood': (cached or {}).get('mood'),
+                    'tshirt': (cached or {}).get('tshirt'),
                 }
-                for r in state.repos
-            ],
-        })
+                dirty.append(profile)
+            profiles.append(profile)
+
+        with state.lock:
+            state.repos = profiles
+            state.recompute_stats()
+        state.flush_scan_cache()
+
+        for profile in dirty:
+            future = executor.submit(analyzer.analyze, profile, generation)
+            state.track_future(future, generation)
+
+        if not dirty:
+            with state.lock:
+                state.scan_in_progress = False
+                state.scan_finished_at = datetime.datetime.now(datetime.timezone.utc)
+            state.log('[repo-sync] every repo matched the content hash and tag list')
+
+        return jsonify(scan_status_payload())
     except Exception as e:
         state.log(f'[repo-sync] fatal error: {e}')
         return jsonify({'error': str(e), 'status': 'error'}), 500
@@ -949,10 +1398,35 @@ def tags_collection():
     return jsonify({'tag': tag, 'tags': state.tags})
 
 
+@app.route('/api/tags/assign', methods=['POST'])
+def assign_tags():
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get('action') or 'assign').strip().lower()
+    tag_ids = [str(tag_id) for tag_id in (payload.get('tag_ids') or []) if str(tag_id).strip()]
+    known = {str(tag.get('id')) for tag in state.tags}
+    tag_ids = [tag_id for tag_id in tag_ids if tag_id in known]
+    if action not in ('assign', 'unassign'):
+        return jsonify({'error': 'Action must be assign or unassign.'}), 400
+    for bucket, raw_ids in (('repos', payload.get('repo_ids') or []), ('chats', payload.get('chat_ids') or [])):
+        for raw_id in raw_ids:
+            key = str(raw_id)
+            current = set(state.tag_assignments.setdefault(bucket, {}).get(key, []) or [])
+            if action == 'assign':
+                current.update(tag_ids)
+            else:
+                current.difference_update(tag_ids)
+            state.tag_assignments[bucket][key] = sorted(current)
+    state.save_tag_cache()
+    return jsonify({'status': 'success', 'assignments': state.tag_assignments})
+
+
 @app.route('/api/tags/<tag_id>', methods=['PUT', 'DELETE'])
 def tag_detail(tag_id):
     if request.method == 'DELETE':
         state.tags = [tag for tag in state.tags if str(tag.get('id')) != str(tag_id)]
+        for bucket in ('repos', 'chats'):
+            for key, assigned in list(state.tag_assignments.get(bucket, {}).items()):
+                state.tag_assignments[bucket][key] = [item for item in assigned if str(item) != str(tag_id)]
         state.save_tag_cache()
         return jsonify({'status': 'success', 'deleted': tag_id})
 
@@ -964,6 +1438,76 @@ def tag_detail(tag_id):
             state.save_tag_cache()
             return jsonify({'tag': tag})
     return jsonify({'error': 'Tag not found.'}), 404
+
+
+def _retag_one(chat_id, generation):
+    with state.work_gate:
+        with state.lock:
+            if generation != state.chat_retag_generation:
+                return
+            chat = next((item for item in state.conversations if str(item.get('id')) == str(chat_id)), None)
+            text = (chat or {}).get('text') or ''
+        if chat is None:
+            return
+        tags = LayaDecisionService().score(text)
+        finished = False
+        with state.lock:
+            if generation != state.chat_retag_generation:
+                return
+            chat['tags'] = tags
+            valid = {str(tag.get('id')) for tag in state.tags}
+            manual = state.tag_assignments.setdefault('chats', {}).get(str(chat_id), []) or []
+            state.tag_assignments['chats'][str(chat_id)] = [item for item in manual if str(item) in valid]
+            state.chat_retag_done += 1
+            finished = state.chat_retag_done >= state.chat_retag_total
+            if finished:
+                state.chat_retag_in_progress = False
+        if finished:
+            state.save_tag_cache()
+            state.log(f'[laya] retagged {state.chat_retag_total} conversations')
+
+
+@app.route('/api/chats/overview', methods=['GET'])
+def chats_overview():
+    return jsonify(chat_overview_payload())
+
+
+@app.route('/api/chats/retag', methods=['POST'])
+def retag_chats():
+    with state.lock:
+        state.chat_retag_generation += 1
+        generation = state.chat_retag_generation
+        chat_ids = [chat.get('id') for chat in state.conversations]
+        state.chat_retag_total = len(chat_ids)
+        state.chat_retag_done = 0
+        state.chat_retag_in_progress = bool(chat_ids)
+    if not chat_ids:
+        return jsonify(chat_overview_payload())
+    for chat_id in chat_ids:
+        executor.submit(_retag_one, chat_id, generation)
+    payload = chat_overview_payload()
+    payload['status'] = 'started'
+    return jsonify(payload)
+
+
+@app.route('/api/chats/<chat_id>', methods=['GET'])
+def chat_detail(chat_id):
+    chat = next((item for item in state.conversations if str(item.get('id')) == str(chat_id)), None)
+    if chat is None:
+        return jsonify({'error': 'Chat not found.'}), 404
+    visible = [tag.get('name') for tag in state.tags if chat_matches_tag(chat, tag)]
+    return jsonify({
+        'id': chat.get('id'),
+        'title': chat.get('title'),
+        'source': chat.get('source'),
+        'created_on': chat.get('created_on'),
+        'summary': chat.get('summary'),
+        'closure_reason': chat.get('closure_reason'),
+        'text': chat.get('text'),
+        'tags': chat.get('tags') or {},
+        'visible_tags': visible,
+        'manual_tags': list(state.tag_assignments.get('chats', {}).get(str(chat_id), []) or []),
+    })
 
 
 @app.route('/api/time_travel/<repo_id>', methods=['POST'])

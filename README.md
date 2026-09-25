@@ -19,11 +19,12 @@ The app uses a dual-engine model:
 - Laya / System 1: tag scoring over the user-managed taxonomy for repos and chats
 - Ollama / System 2: summaries, mood, effort, and closure logic for the local analysis pipeline
 
-Repository sync is a two-step flow. The GitHub scan returns all repo titles immediately, and each card updates in place as background workers finish their ZIP analysis, Laya tags, and Ollama summaries. This keeps the UI responsive while the deeper scan continues.
+Repository sync lists every repo card before any ZIP download. A content hash of `pushed_at`, size, and repo id, plus a fingerprint of the tag list, decides whether a card is reused from `data/scan_cache.json`. Only changed repos are analyzed, a few at a time, in memory. The header shows a percent complete, and a scan log records which Laya backend is in use. Cards stay in place, so Time Travel and tag selection keep working while other repos are still running. Disk writes of the analysis snapshot are batched.
 
 ## Repository graveyard
 
 The repo graveyard includes:
+- hash cache so an unchanged repo and an unchanged tag list skip reprocessing
 - FIFO in-memory zip cache for active repo context
 - custom vs boilerplate heuristics for code footprint analysis
 - secret, TODO, smell, env, schema, and endpoint extraction from ZIP contents
@@ -33,16 +34,13 @@ The repo graveyard includes:
 
 ## Chat corpus
 
-The chat pipeline accepts ChatGPT JSON and Gemini HTML/JSON exports, keeps the original content in RAM, and surfaces:
-- file-level metadata and platform badges
-- closure classification: SOLVED, CONTEXT_LOST, TIMEOUT
-- extractive plus LLM summary generation
-- four-word title and sentence summary patterns for chat threads
-- topic-shift awareness and complexity buckets
+The chat pipeline accepts ChatGPT JSON and Gemini HTML/JSON exports and keeps the original content in RAM. On import it stores a short summary, a closure label (`SOLVED`, `CONTEXT_LOST`, `TIMEOUT`), a calendar day when the export has one, and Laya scores for every current tag.
+
+The Chat tab can be read while tagging runs. It shows a source and closure summary, a GitHub-style day heatmap, and a reverse count of how many conversations match each tag at the confidence threshold. Opening a conversation shows the summary and the stored text. **Tagelés újrafuttatása** rescores every loaded conversation against the current tag list and does not start a GitHub sync. Manual tag assignments stay unless that tag was removed.
 
 ## Taxonomy and linking
 
-The app maintains a single global taxonomy that can be created, renamed, deleted, and bulk-assigned across repos and chats. Laya scores are computed against the user-managed tag set, and the confidence slider filters what appears in the UI and AI Linker recommendations.
+The app maintains a single global taxonomy. Settings opens a tag-list modal for create, rename, and delete, and a separate Laya modal for backend (`auto`, `transformers`, `ollama`, `keyword`), model id, and the confidence slider. Repo and chat cards can be multi-selected and bulk-assigned. Laya scores each conversation and each analyzed repo against that tag list. `auto` tries the optional transformers zero-shot model, then Ollama JSON scores, then keyword overlap.
 
 ## Analytics
 
@@ -56,12 +54,10 @@ The dashboard includes:
 ## Operations
 
 The interface includes:
-- GitHub PAT and Ollama settings
-- cache size and chunk-size tuning
-- description word budget configuration
-- Laya backend selection and confidence threshold
-- scan log and status updates
-- export helpers that build files in memory and stream downloads without writing to output/
+- GitHub PAT, Ollama URL, model, and RAM cache size
+- a percent bar and collapsible scan log during repo sync
+- a percent bar while conversation retagging is running
+- Laya calibration and the tag editor, each behind its own settings button
 
 ## Setup
 

@@ -17,8 +17,9 @@ This roadmap reflects the shipped RAM-first architecture for Project Riser. The 
 ### FIFO cache and scan persistence
 
 - The active repo ZIP cache uses an in-memory FIFO strategy with a default capacity of 5 repos.
-- The app persists repo metadata and scan snapshots to data/scan_cache.json so the saved state survives a restart.
-- The app keeps the current session repo cards and analysis results in memory during use, while the JSON snapshot stays small and portable.
+- The app persists repo metadata and analysis snapshots to data/scan_cache.json so the saved state survives a restart.
+- A content hash of GitHub `pushed_at`, size, and repo id, together with a tag-list fingerprint, skips reprocessing when neither changed.
+- Snapshot writes are batched. ZIP bytes and chat bodies stay in memory.
 
 ### Tag taxonomy
 
@@ -30,11 +31,11 @@ This roadmap reflects the shipped RAM-first architecture for Project Riser. The 
 
 ### Seamless two-step batch processing
 
-1. The GitHub sync response immediately seeds all repo titles into the UI grid.
-2. Background workers finish deep scans and update the same cards in place.
-3. The status area shows progress like "Analyzing 5/50 repos..." while the grid remains stable.
+1. The GitHub sync response immediately seeds every repo card into the UI grid.
+2. A bounded pool analyzes only repos whose content hash or tag fingerprint changed, and updates those cards in place.
+3. A percent bar shows ready or error cards against the total, including how many came from cache. A collapsible log shows worker and Laya events. Cards stay interactive during the scan.
 
-This behavior is implemented with keyed repo updates rather than re-rendering the entire grid.
+Dead LoC and Dead Repos are derived from the current cards, so the counters follow finished analysis instead of resetting at the start of a sync.
 
 ## 3. Laya & confidence filtering
 
@@ -49,9 +50,10 @@ The app uses a lightweight Laya-style score model against the current taxonomy i
 ## 5. Chat corpus pipeline
 
 - ChatGPT JSON and Gemini HTML/JSON exports are parsed in memory.
-- Platform badges and closure analysis are retained.
-- Topic shifts and complexity heuristics are supported as a lightweight local pipeline.
-- Historical conversations are kept in memory and may be matched against repos using tag overlap.
+- Import analysis stores a summary, closure, an optional calendar day, and Laya tag scores.
+- The Chat tab reads conversations, draws a day heatmap, and counts matches per tag.
+- Retagging reruns Laya on loaded conversations when the tag list changes, without a GitHub sync.
+- Manual assignments are kept separately from Laya scores.
 
 ## 6. Deep extraction and code intelligence
 
@@ -87,19 +89,20 @@ These settings are saved in the compact tag/settings JSON cache so they survive 
 ## 9. Current product status
 
 The project currently ships the following core behavior:
-- GitHub repo scan and seeded repo cards
-- RAM-first ZIP analysis
-- Laya-style tag scoring and confidence-aware matching
-- local chat parsing and closure analysis
-- settings persistence and compact cache files
-- repo metadata persistence in data/scan_cache.json
+- GitHub repo scan that seeds every card, then analyzes changed repos in parallel
+- hash and tag-fingerprint cache with batched scan snapshots
+- percent progress, scan log, and in-place card updates
+- Laya tagging for repos and conversations, with a calibration modal
+- tag editor and bulk assign or unassign
+- chat reader with heatmap, summary, and per-tag counts
+- conversation retag independent of GitHub sync
 
 ## Open items
 
-- Extend the full UI to expose more advanced tag bulk operations in the browser.
-- Add a richer chat modal for topic splitting and complexity editing.
-- Expand the code extraction pipeline for more framework-specific heuristics and route generation.
-- Add fuller export panels and richer AI Linker scoring in the front-end.
+- Chat modal for editing topic splits and complexity by hand.
+- More framework-specific extraction and route heuristics.
+- CSV and welcome-back export panels, and an AI Linker view in the front end.
+- Settings controls for chunk size and description word budget. The server already stores both.
 
 
 
