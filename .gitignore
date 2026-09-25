@@ -221,3 +221,7 @@ __marimo__/
 data/cache.json
 uploads/
 output/
+
+# PyCharm
+.idea/misc.xml
+.idea/
