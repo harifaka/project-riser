@@ -2,53 +2,83 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Project Riser v7 🚀</title>
+    <title>Project Riser 🚀</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 </head>
 <body>
-    <div class="sidebar">
-        <div class="logo">🚀 Project Riser v7</div>
-        <div class="stats-grid">
-            <div class="stat-card"><span>Dead LoC</span><strong id="statLoc">0</strong></div>
-            <div class="stat-card"><span>Dead Repos</span><strong id="statDead" class="danger">0</strong></div>
-        </div>
-        <nav>
-            <button class="nav-btn active" onclick="app.switchTab('repos')">📂 Repository Graveyard</button>
-            <button class="nav-btn" onclick="app.switchTab('chats')">💬 Chat AI Corpus</button>
-            <button class="nav-btn outline" style="border-color:var(--primary); color:var(--primary); margin-top:10px;" onclick="app.openGraveyardAnalytics()">📊 Graveyard Analytics</button>
-        </nav>
-        <div class="spacer"></div>
-        <button class="nav-btn outline" onclick="app.toggleSettings()">⚙️ Settings & Cache</button>
-    </div>
-
-    <div class="main-content" id="reposTab">
-        <div class="header">
-            <div>
-                <h1>In-Memory Resurrection</h1>
-                <p class="subtitle">Streaming GitHub ZIPs into Virtual RAM Cache.</p>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="brand-block">
+                <div class="brand-mark">P</div>
+                <div class="brand-copy">
+                    <div class="brand-label">Project Riser</div>
+                    <small>operations suite</small>
+                </div>
             </div>
-            <button class="btn primary" onclick="app.scanRepos()">🔄 Sync GitHub</button>
-        </div>
-        <div id="repoStatus" class="status-text"></div>
-        <div class="grid" id="repoContainer"></div>
-    </div>
 
-    <div class="main-content" id="chatsTab" style="display:none;">
-        <div class="header">
-            <div>
-                <h1>AI Chat Corpus</h1>
-                <p class="subtitle">Import ChatGPT JSON or Gemini HTML/text exports to map closure intents.</p>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <span>Dead LoC</span>
+                    <strong id="statLoc">0</strong>
+                </div>
+                <div class="stat-card">
+                    <span>Dead Repos</span>
+                    <strong id="statDead" class="danger">0</strong>
+                </div>
             </div>
-            <input type="file" id="chatInput" multiple accept="*/*" style="display:none;" onchange="app.uploadChats()">
-            <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload Any Chats</button>
-        </div>
-        <div id="chatStatus" class="status-text"></div>
-        <div class="card" style="margin-top:16px;">
-            <h3 style="margin-top:0;">Imported Files</h3>
-            <div id="chatFilesList" class="file-list"></div>
-        </div>
-        <div class="grid" id="chatContainer"></div>
+
+            <nav>
+                <button class="nav-btn active" onclick="app.switchTab('repos')">
+                    <span>Repository Graveyard</span>
+                </button>
+                <button class="nav-btn" onclick="app.switchTab('chats')">
+                    <span>Chat AI Corpus</span>
+                </button>
+                <button class="nav-btn outline analytics-button" onclick="app.openGraveyardAnalytics()">
+                    <span>Graveyard Analytics</span>
+                </button>
+            </nav>
+
+            <div class="spacer"></div>
+
+            <button class="nav-btn outline settings-button" onclick="app.toggleSettings()">
+                <span>Settings & Cache</span>
+            </button>
+        </aside>
+
+        <main class="workspace">
+            <div class="main-content" id="reposTab">
+                <div class="header shell-panel">
+                    <div>
+                        <div class="eyebrow">Operational intelligence</div>
+                        <h1>In-Memory Resurrection</h1>
+                        <p class="subtitle">Streaming GitHub ZIPs into a virtual RAM cache.</p>
+                    </div>
+                    <button class="btn primary" onclick="app.scanRepos()">↻ Sync GitHub</button>
+                </div>
+                <div id="repoStatus" class="status-text"></div>
+                <div class="grid" id="repoContainer"></div>
+            </div>
+
+            <div class="main-content" id="chatsTab" style="display:none;">
+                <div class="header shell-panel">
+                    <div>
+                        <div class="eyebrow">Knowledge intake</div>
+                        <h1>AI Chat Corpus</h1>
+                        <p class="subtitle">Import ChatGPT JSON or Gemini HTML/text exports to map closure intents.</p>
+                    </div>
+                    <input type="file" id="chatInput" multiple accept="*/*" style="display:none;" onchange="app.uploadChats()">
+                    <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload Any Chats</button>
+                </div>
+                <div id="chatStatus" class="status-text"></div>
+                <div class="card shell-panel" style="margin-top:16px;">
+                    <h3 style="margin-top:0;">Imported Files</h3>
+                    <div id="chatFilesList" class="file-list"></div>
+                </div>
+                <div class="grid" id="chatContainer"></div>
+            </div>
+        </main>
     </div>
 
     <!-- Analytics Modal (Exportable) -->
@@ -56,7 +86,7 @@
         <div class="modal" id="analyticsDashboard" style="width: 900px; max-width:95%; background:#0a0a0a; border: 2px solid var(--primary);">
             <div style="display:flex; justify-content:space-between; margin-bottom:20px;">
                 <h2 style="margin:0; color:var(--primary);">🪦 Graveyard Analytics</h2>
-                <div class="logo">Project Riser v7</div>
+                <div class="logo">Project Riser</div>
             </div>
             
             <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom:20px;">

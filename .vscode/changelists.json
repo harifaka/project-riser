@@ -1,0 +1,14 @@
+{
+  "changelists": [
+    {
+      "name": "Default",
+      "files": [
+        "static/css/style.css",
+        "templates/index.html",
+        "TECHSTACK.md",
+        ".vscode/changelists.json"
+      ]
+    }
+  ],
+  "active": "Default"
+}
