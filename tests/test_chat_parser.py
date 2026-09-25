@@ -139,6 +139,39 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(LLMService.ask("Estimate resurrection effort (S, M, L, XL)...", "http://localhost:11434", "llama3.1"), "M")
         self.assertEqual(LLMService.ask("Write a 1-sentence summary of this code:", "http://localhost:11434", "llama3.1"), "No code extracted.")
 
+    @patch("app.Github")
+    def test_scan_github_seeds_repo_cards_immediately(self, mock_github):
+        repo = Mock(
+            id=42,
+            full_name="octo/demo",
+            name="demo",
+            updated_at=datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc),
+            size=40,
+        )
+        repo.get_commits.return_value = []
+        user = Mock()
+        user.get_repos.return_value = [repo]
+        mock_github.return_value.get_user.return_value = user
+
+        with app.test_client() as client:
+            response = client.post(
+                "/api/github/scan",
+                json={
+                    "token": "abc123",
+                    "ollama_url": "http://localhost:11434",
+                    "ollama_model": "llama3.1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["repos"][0]["status"], "pending")
+        self.assertEqual(payload["repos"][0]["full_name"], "octo/demo")
+
+    def test_description_is_clamped_to_word_budget(self):
+        text = "one two three four five six seven"
+        self.assertEqual(LLMService.clamp_description(text, 4), "one two three four")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,31 +4,31 @@ overview: Implement leftover ROADMAP.md work with ZIP/analysis in RAM, a small o
 todos:
   - id: two-step-scan
     content: Seed all repo titles immediately; background-update cards in place; flicker-free poll UI + progress
-    status: in_progress
+    status: completed
   - id: tags-laya-confidence
     content: Persist tag list and info to a small disk cache; Laya scores computed in RAM; confidence slider
-    status: pending
+    status: completed
   - id: description-length
     content: Settings word-budget for Ollama descriptions; GitHub description as instant placeholder
-    status: pending
+    status: completed
   - id: chat-corpus-leftovers
     content: Keep chat imports in RAM (stop writing uploads/); feed badges, titles/summaries, topic-split, complexity
-    status: pending
+    status: completed
   - id: deep-extraction
     content: Fill tech stack, env template, schemas, endpoints, logs, multi-factor abandon score
-    status: pending
+    status: completed
   - id: export-linker
     content: Stream CSV and WELCOME_BACK.md from memory (no output/ writes); AI Linker; real match score
-    status: pending
+    status: completed
   - id: scan-ux-settings
     content: Collapsible scan log, chunk size, cache 5-20, persist new settings
-    status: pending
+    status: completed
   - id: rewrite-readme
     content: Rewrite README.md as a professional description of all product functionality and setup
-    status: pending
+    status: completed
   - id: update-roadmap
     content: Update ROADMAP.md to match shipped RAM-first design, Laya tags, live scan, and remaining gaps
-    status: pending
+    status: completed
 isProject: false
 ---
 

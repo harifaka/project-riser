@@ -3,10 +3,14 @@
     {
       "name": "Default",
       "files": [
-        "static/css/style.css",
-        "templates/index.html",
-        "TECHSTACK.md",
-        ".vscode/changelists.json"
+        "tests/test_chat_parser.py",
+        ".vscode/changelists.json",
+        "app.py",
+        "data/tags.json",
+        "README.md",
+        "data/scan_cache.json",
+        "ROADMAP.md",
+        ".cursor/plans/roadmap_leftover_features_0c958896.plan.md"
       ]
     }
   ],

@@ -1,0 +1,24 @@
+{
+  "repos": [
+    {
+      "id": 42,
+      "full_name": "octo/demo",
+      "name": "octo/demo",
+      "description": "GitHub repository",
+      "last_update": "2025-01-01T00:00:00+00:00",
+      "updated_at": "2025-01-01T00:00:00+00:00",
+      "size": 40,
+      "status": "pending",
+      "tags": {}
+    }
+  ],
+  "stats": {
+    "total_loc": 0,
+    "abandoned_count": 0,
+    "secrets_found": 0,
+    "smells_found": 0
+  },
+  "scan_in_progress": true,
+  "scan_started_at": "2026-09-25T06:12:55.286867+00:00",
+  "scan_finished_at": null
+}

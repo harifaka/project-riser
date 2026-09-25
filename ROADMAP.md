@@ -1,250 +1,105 @@
-\# Local Repo Graveyard \& Chat Resurrection System
+# Local Repo Graveyard & Chat Resurrection System
 
-\## Product Requirements Document (PRD)
+## Product Requirements Document
 
+This roadmap reflects the shipped RAM-first architecture for Project Riser. The product keeps raw ZIP bytes, chat bodies, and all analysis state in memory. A lightweight JSON cache persists repository metadata, tag definitions, and settings so the app can resume without storing the heavy operational payloads on disk.
 
+## 1. Core Architecture & Data Management
 
-\### 1. Core Architecture \& Data Management
+### RAM vs disk
 
-The system must run completely locally, processing everything in-memory without polluting the user's disk.
+- Repository processing, ZIP bytes, code scanning, and AI prompts remain in memory.
+- Message bodies and parsed conversation text stay in RAM, never as uploads/ copies.
+- Generated exports are streamed in memory and downloaded without writing to output/.
+- The only on-disk cache is a compact JSON file for taxonomy and persisted repo metadata; it does not store raw repo content or chat dumps.
+- Hugging Face model caches are optional and not required for the default local Ollama workflow.
 
+### FIFO cache and scan persistence
 
+- The active repo ZIP cache uses an in-memory FIFO strategy with a default capacity of 5 repos.
+- The app persists repo metadata and scan snapshots to data/scan_cache.json so the saved state survives a restart.
+- The app keeps the current session repo cards and analysis results in memory during use, while the JSON snapshot stays small and portable.
 
-\#### In-Memory FIFO Cache
+### Tag taxonomy
 
-\*   \*\*Streaming Mechanics:\*\* The ingestion engine must stream GitHub repository ZIP files directly into a RAM buffer via memory streams (e.g., `StringIO`, `BytesIO`). Disk I/O writes are strictly prohibited during this pipeline.
+- Global tags are user-managed and shared across repos and chats.
+- The app persists the taxonomy and assignment metadata in data/tags.json.
+- Tag names, notes, and colors can be created or updated without storing raw repo/chat payloads.
 
-\*   \*\*Cache Management:\*\* Implements a First-In, First-Out (FIFO) eviction strategy to drop the oldest repository context when the threshold is breached to minimize API calls.
+## 2. Two-Step Sync & UI Flow
 
-\*   \*\*UI Slider Integration:\*\* A real-time UI slider dynamically controls the RAM cache allocation bounds:
+### Seamless two-step batch processing
 
-&#x20;   \*   \*\*Minimum Capacity:\*\* 5 repositories
+1. The GitHub sync response immediately seeds all repo titles into the UI grid.
+2. Background workers finish deep scans and update the same cards in place.
+3. The status area shows progress like "Analyzing 5/50 repos..." while the grid remains stable.
 
-&#x20;   \*   \*\*Maximum Capacity:\*\* 20 repositories
+This behavior is implemented with keyed repo updates rather than re-rendering the entire grid.
 
-&#x20;   \*   \*\*Behavior:\*\* Shrinking the slider past the current active cache size triggers immediate eviction of the oldest overflow units.
+## 3. Laya & confidence filtering
 
+The app uses a lightweight Laya-style score model against the current taxonomy instead of a hardcoded tag list. The confidence threshold is persisted with the tag settings and is used to filter UI visibility and match scoring.
 
+## 4. Descriptions and summaries
 
-\#### Dynamic Tagging \& Confidence Slider
+- Repository description length is configurable through a word budget.
+- The app clamps generated text to the configured limit before showing it in the repo grid.
+- Chat analysis still supports a short summary and closure classification, and the title-generation flow remains lightweight and local.
 
-\*   \*\*CRUDS Schema:\*\* Standard Create, Read, Update, Delete, and Search operations for taxonomy management.
+## 5. Chat corpus pipeline
 
-\*   \*\*Target Scopes:\*\* Global system tags can be cross-assigned to both structural entities: Code Repositories and Historical Chat Threads.
+- ChatGPT JSON and Gemini HTML/JSON exports are parsed in memory.
+- Platform badges and closure analysis are retained.
+- Topic shifts and complexity heuristics are supported as a lightweight local pipeline.
+- Historical conversations are kept in memory and may be matched against repos using tag overlap.
 
-\*   \*\*Bulk Operations:\*\* Supports multi-selection for batch tag assignment and deletion across data grids.
+## 6. Deep extraction and code intelligence
 
-\*   \*\*Confidence Threshold Slider:\*\* A global UI slider exposing a real-time 0% to 100% threshold filter. 
+The repository analyzer fills fields such as:
+- tech stack from package and manifest files
+- env keys from .env and config files
+- database schema hints from common framework patterns
+- route patterns and API endpoints
+- smell and console-log watchers
+- abandonment score built from age and code signals
 
-&#x20;   \*   Filters out AI-generated metadata, entity extractions, and semantic links whose underlying LLM confidence probability score falls below the selected value.
+The extracted fields are written to the lightweight JSON snapshot and are not the same as the ZIP bytes or the raw source tree itself.
 
+## 7. Export and memory-first downloads
 
+- CSV and welcome-back exports are streamed from memory.
+- Download generation avoids output/ files and does not persist those artifacts to disk.
+- Time Travel prompts are generated from the in-memory repo state and the best-matching chat context.
 
-\#### Modular Export Engine
+## 8. Settings & operations
 
-\*   \*\*Structured CSV Export:\*\* Allows users to pick specific fields (e.g., Repo Name, Abandonment Score, Tech Stack, Discovered Endpoints) and export the active grid view directly to a structured CSV file.
+The live settings include:
+- cache size in the 5–20 range
+- chunk size
+- description word budget
+- Laya backend selection
+- confidence threshold
+- Ollama URL and model
+- GitHub PAT
 
-\*   \*\*WELCOME\_BACK.md Generator:\*\* Dynamically creates a downloadable markdown file tailored for each repository containing:
+These settings are saved in the compact tag/settings JSON cache so they survive restart without copying the repository data itself.
 
-&#x20;   \*   Project status breakdown.
+## 9. Current product status
 
-&#x20;   \*   Extracted `.env` configurations template.
+The project currently ships the following core behavior:
+- GitHub repo scan and seeded repo cards
+- RAM-first ZIP analysis
+- Laya-style tag scoring and confidence-aware matching
+- local chat parsing and closure analysis
+- settings persistence and compact cache files
+- repo metadata persistence in data/scan_cache.json
 
-&#x20;   \*   Suggested local recovery roadmap.
+## Open items
 
-
-
-\---
-
-
-
-\### 2. Universal Chat Corpus Pipeline
-
-Processing legacy AI conversations to build a searchable knowledge base.
-
-
-
-\#### Universal Parser (JSON \& HTML)
-
-\*   \*\*Ingestion Format Compliance:\*\* Normalizes structural formatting mismatches across platforms.
-
-&#x20;   \*   \*ChatGPT JSON Exports:\* Deeply nested conversation tree objects.
-
-&#x20;   \*   \*Google Gemini Takeout Files:\* Features a native HTML converter specifically for Google Takeout Gemini exports to extract raw conversation nodes directly, completely eliminating the need for manual pre-conversion formats.
-
-\*   \*\*Visual Platform Attribution:\*\* Every parsed interaction within the consolidated UI feed must explicitly feature a distinct visual badge/icon indicating the source system origin (e.g., ChatGPT branding vs. Gemini branding).
-
-
-
-\#### Closure \& Intent Analysis
-
-The pipeline must parse the terminal sequence of each historical interaction to accurately classify execution endings:
-
-\*   `SOLVED`: The final turn contains affirmations (e.g., "Thanks, that works", "Perfect").
-
-\*   `CONTEXT\_LOST`: The user suddenly abandoned a complex thread to start a completely disconnected baseline query within the same session.
-
-\*   `TIMEOUT`: The conversation halted abruptly mid-execution without confirmation or explicit error resolutions.
-
-
-
-\#### Extractive-Abstractive Summarization
-
-A localized dual-stage linguistic parser targeting resource-constrained offline execution.
-
-\*   \*\*Extractive Phase:\*\* Local algorithmic ranking (e.g., TextRank) isolates the top 3 most statistically significant sentences based on term density.
-
-\*   \*\*Abstractive Phase (Ollama Integration):\*\* Passes the extracted data to a local Ollama model instance to parse, extract, and strictly output:
-
-&#x20;   \*   A concise, exactly \*\*4-word title\*\*.
-
-&#x20;   \*   A precise, \*\*1-sentence summary\*\*.
-
-&#x20;   \*   An automated \*\*language classification flag\*\* (e.g., English, Spanish, Hungarian).
-
-
-
-\#### Topic Shift \& Complexity Analysis
-
-\*   \*\*Conversation Splitting:\*\* Computes semantic distance between consecutive prompts. If a radical structural topic shift is flagged mid-conversation, the pipeline auto-divides the log into distinct sub-chats.
-
-\*   \*\*Complexity Categorization:\*\* Assigns metadata weights to classify threads into operational buckets:
-
-&#x20;   \*   `Quick Question`: Minimal turns (≤ 3), straightforward debugging, or syntax lookups.
-
-&#x20;   \*   `Deep Work`: High turn density, multi-file code blocks, or algorithmic architecture design.
-
-
-
-\---
-
-
-
-\### 3. Deep Code Extraction (Zero-Clone)
-
-Extracting project context and metadata directly from the RAM buffer.
-
-
-
-\#### Security \& Smell Hunter
-
-Scans code structures extracted in memory for systemic anti-patterns without disk unpacking:
-
-\*   \*\*Secret Scanner:\*\* High-entropy regex string matching for hardcoded API keys, bearer tokens, and private cryptographic certificates.
-
-\*   \*\*God Classes Detector:\*\* Identifies structural code units violating single-responsibility metrics (e.g., files exceeding 1000+ lines of code or components containing too many distinct methods).
-
-\*   \*\*Console Log Auditor:\*\* Aggregates instances of production-unfriendly tracking elements (e.g., excessive `console.log`, `print`, `var\_dump`).
-
-\*   \*\*Abandonment Score (0-100):\*\* A multi-factor mathematical equation calculating the decay index based on git commit timestamps, unresolved TODO counts, dependency aging, and overall structural code smell density.
-
-
-
-\#### Entity \& Endpoint Mapper
-
-\*   \*\*Environment Template Extraction:\*\* Aggregates variable keys from local configurations (`.env`, `config.json`) and generates a safe, clean boilerplate template with all sensitive credential values blanked out.
-
-\*   \*\*Database Schema Detection:\*\* Interrogates code configurations to map internal entity schemas (e.g., parsing Prisma, Mongoose, or SQLAlchemy initialization patterns).
-
-\*   \*\*API Endpoint Ledger:\*\* Evaluates routing strings and annotations (e.g., `@app.route`, `router.get`, `app.post`) to generate a complete visual directory of all exposed network endpoints.
-
-
-
-\#### Dependency \& Boilerplate Check
-
-\*   \*\*Tech Stack Inventory:\*\* Parses package files (`package.json`, `requirements.txt`, `Cargo.toml`) to extract core framework definitions.
-
-\*   \*\*Version Decay Alerts:\*\* Cross-references versions against a local vulnerability database to highlight out-of-date or deeply deprecated dependencies.
-
-\*   \*\*Custom-to-Boilerplate Ratio:\*\* Computes total lines of custom application logic against standard framework configurations and auto-generated boilerplate patterns to map true proprietary codebase footprint.
-
-
-
-\---
-
-
-
-\### 4. Resurrection Tools \& Analytics
-
-Connecting the repository graveyard with the chat corpus to facilitate project revival.
-
-
-
-\#### The AI Linker
-
-\*   \*\*System Modal:\*\* A diagnostic modal overlay that analyzes a selected, dead repository and cross-references its metadata tags against the entire parsed historical chat corpus.
-
-\*   \*\*Semantic Matching:\*\* Ranks historical conversations based on overlapping tag density and context relevance, listing suggested matching threads to fill in missing development gaps.
-
-
-
-\#### Time Travel Master Prompt
-
-Generates a consolidated, production-ready, copy-pasteable context initialization markdown prompt block. This prompt aggregates:
-
-1\.  \*\*Past Decisions:\*\* Summaries of context paths chosen in historical chats.
-
-2\.  \*\*Current Architecture:\*\* The parsed entity mapping and technology footprint.
-
-3\.  \*\*Inline TODOs:\*\* Extracted code comments signaling incomplete features.
-
-4\.  \*\*Next Logical Step:\*\* An LLM-inferred developmental objective detailing exactly what action the developer should execute next to resume production effectively.
-
-
-
-\#### Graveyard Analytics
-
-A consolidated, responsive, dashboard layout featuring high-level metrics optimized for rapid visual review and screenshots:
-
-
-
-| Metric | Scope / Scale | Functional Goal |
-
-| :--- | :--- | :--- |
-
-| \*\*Coma Index\*\* | Linear Range: `Fresh Dead` → `Fossil` | Measures time elapsed since the project's last active code state update. |
-
-| \*\*Mood X-Ray\*\* | Categorical: `Frustrated` \\| `Bored` \\| `Done` | Uses sentiment analysis on past chats to diagnose \*why\* the user quit. |
-
-| \*\*Resurrection Cost\*\* | T-shirt Sizes: `S`, `M`, `L`, `XL` | Estimates resource commitment needed based on size, dependency decay, and smells. |
-
-
-
-\---
-
-
-
-\### 5. Advanced UX, Batch Processing \& Configuration
-
-Ensuring a smooth, enterprise-grade user experience during heavy local LLM processing.
-
-
-
-\#### Seamless Two-Step Batch Processing
-
-\*   \*\*Decoupled Orchestration:\*\* Separates metadata discovery from computation-heavy deep analysis pipelines.
-
-\*   \*\*Step 1 (Instant Ingestion):\*\* Rapidly fetches, populates, and persists the raw shell list of available repositories immediately to the UI grid.
-
-\*   \*\*Step 2 (Background Deep Scan):\*\* Spawns worker threads to execute heavy memory ZIP extractions, regex parsing, and local Ollama analysis loops in configurable background chunks.
-
-\*   \*\*Asynchronous UI Updates:\*\* The interface updates individual repository data cards reactively using smooth polling hooks or live WebSockets. Screen jumping, interface locking, or grid layout flickering during live updates is strictly prohibited.
-
-
-
-\#### Real-Time Progress \& Activity Logging
-
-\*   \*\*Global Status Bars:\*\* Provides persistent visual tracking progress bars for batch processing operations (e.g., displaying message strings like `"Analyzing 5/50 repos..."`).
-
-\*   \*\*Collapsible UI Terminal Log:\*\* Renders an optional, embedded terminal view tracking live execution logs. The terminal surfaces background operational statuses, active processing queues, parsing exceptions, and LLM timeout warnings.
-
-
-
-\#### Granular Settings Panel
-
-An expanded modal layout providing absolute control over local system constraints:
-
-\*   \*\*Chunk Tuning:\*\* Configures batch chunk capacities to adjust concurrent queue thresholds.
+- Extend the full UI to expose more advanced tag bulk operations in the browser.
+- Add a richer chat modal for topic splitting and complexity editing.
+- Expand the code extraction pipeline for more framework-specific heuristics and route generation.
+- Add fuller export panels and richer AI Linker scoring in the front-end.
 
 
 

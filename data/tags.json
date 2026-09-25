@@ -1,0 +1,47 @@
+{
+  "tags": [
+    {
+      "id": "backend",
+      "name": "backend",
+      "color": "#22c55e"
+    },
+    {
+      "id": "frontend",
+      "name": "frontend",
+      "color": "#38bdf8"
+    },
+    {
+      "id": "debugging",
+      "name": "debugging",
+      "color": "#f59e0b"
+    },
+    {
+      "id": "architecture",
+      "name": "architecture",
+      "color": "#a78bfa"
+    },
+    {
+      "id": "database",
+      "name": "database",
+      "color": "#f472b6"
+    },
+    {
+      "id": "devops",
+      "name": "devops",
+      "color": "#f87171"
+    }
+  ],
+  "assignments": {
+    "repos": {},
+    "chats": {}
+  },
+  "settings": {
+    "cache_size": 5,
+    "description_word_budget": 18,
+    "chunk_size": 5,
+    "confidence": 70,
+    "laya_backend": "auto",
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3.1"
+  }
+}
