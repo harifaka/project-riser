@@ -1,0 +1,4 @@
+# Optional System 1 (Laya) backend. The app runs without these packages
+# and falls back to Ollama JSON scoring, then keyword overlap.
+transformers>=4.40.0
+torch>=2.1.0

@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local runtime caches (tag list/info only; never ZIP or chat dumps)
+data/cache.json
+uploads/
+output/
