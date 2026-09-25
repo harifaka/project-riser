@@ -6,8 +6,10 @@ from app import (
     SCAN_CACHE_PATH,
     TAGS_CACHE_PATH,
     ChatAnalyzer,
+    ChatLinker,
     LayaDecisionService,
     LLMService,
+    TimeTravelService,
     app,
     chat_overview_payload,
     content_fingerprint,
@@ -320,6 +322,150 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertIn("healthcare", state.conversations[0]["tags"])
         self.assertIn("healthcare", state.tag_assignments["chats"]["c1"])
         mock_github.assert_not_called()
+
+
+class ChatLinkerTests(unittest.TestCase):
+    def setUp(self):
+        self._repos = list(state.repos)
+        self._conversations = list(state.conversations)
+        self._confidence = state.settings.get('confidence')
+        state.settings['confidence'] = 70
+        state.conversations = []
+        state.link_in_progress = False
+
+    def tearDown(self):
+        state.repos = self._repos
+        state.conversations = self._conversations
+        state.settings['confidence'] = self._confidence
+        state.link_in_progress = False
+
+    def _repo(self):
+        return {
+            'id': 'repo-bce',
+            'name': 'bce',
+            'description': 'Invoice reconciliation pays each ledger payout through a flask webhook.',
+            'tech_stack': ['flask'],
+            'endpoints': ['POST /invoices/reconcile'],
+            'todos': ['finish invoice reconciliation webhook'],
+            'tags': {'backend': 0.92},
+            'status': 'ready',
+            'tshirt': 'M',
+            'mood': 'DONE',
+            'linked_chats': [],
+            'rejected_chat_fingerprints': [],
+        }
+
+    def _good_chat(self):
+        return {
+            'id': 'chat-invoice',
+            'title': 'Unfinished payout flow',
+            'summary': 'Invoice reconciliation webhook left unfinished',
+            'text': 'We stopped halfway through invoice reconciliation. The flask webhook still needs to post each ledger payout.',
+            'tags': {'backend': 0.9},
+            'created_on': '2024-03-01',
+        }
+
+    def _name_only_chat(self):
+        return {
+            'id': 'chat-abc',
+            'title': 'Old ABC name',
+            'summary': 'Rename notes',
+            'text': 'The old project name was ABC. This thread is only about sourdough hydration and starter feeding schedules.',
+            'tags': {'cooking': 0.95},
+            'created_on': '2024-04-01',
+        }
+
+    def test_behavior_overlap_links_without_the_repo_name(self):
+        repo = self._repo()
+        good = self._good_chat()
+        bad = self._name_only_chat()
+        called = []
+
+        def confirmer(_repo, chat, score):
+            called.append(chat['id'])
+            return {'match': score, 'reason': 'This conversation describes the unfinished invoice reconciliation flow.'}
+
+        links = ChatLinker().propose_links(repo, [good, bad], confirmer=confirmer)
+
+        self.assertEqual(called, ['chat-invoice'])
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]['chat_id'], 'chat-invoice')
+        self.assertNotIn('bce', good['text'].lower())
+        self.assertGreaterEqual(links[0]['score'], 0.7)
+
+    def test_old_name_alone_does_not_link(self):
+        repo = self._repo()
+        bad = self._name_only_chat()
+        same_name = {
+            'id': 'chat-name',
+            'title': 'abc',
+            'text': 'abc abc abc ideas for later',
+            'tags': {},
+            'summary': 'abc',
+        }
+        named = dict(repo)
+        named['name'] = 'abc'
+        score, overlap = ChatLinker.cheap_score(named, same_name)
+        self.assertLess(score, 0.7)
+        self.assertFalse(overlap)
+        links = ChatLinker().propose_links(repo, [bad], confirmer=lambda *_args: {'match': 1, 'reason': 'should not run'})
+        self.assertEqual(links, [])
+
+    def test_rejected_fingerprint_stays_unlinked_and_pins_survive(self):
+        repo = self._repo()
+        good = self._good_chat()
+        fingerprint = ChatLinker.chat_fingerprint(good)
+        repo['rejected_chat_fingerprints'] = [fingerprint]
+        repo['linked_chats'] = [{
+            'chat_id': 'kept',
+            'fingerprint': 'pinned-fp',
+            'score': 0.4,
+            'reason': 'Kept by hand.',
+            'title': 'Pinned plan',
+            'pinned': True,
+        }]
+        auto = ChatLinker().propose_links(repo, [good], confirmer=lambda *_args: {'match': 1, 'reason': 'no'})
+        merged = ChatLinker.merge_links(repo['linked_chats'], auto, repo['rejected_chat_fingerprints'])
+        self.assertEqual(auto, [])
+        self.assertEqual([link['fingerprint'] for link in merged], ['pinned-fp'])
+
+    def test_time_travel_quotes_linked_chats_only(self):
+        good = self._good_chat()
+        second = {
+            'id': 'chat-retry',
+            'title': 'Webhook retry',
+            'summary': 'Retry the ledger payout webhook',
+            'text': 'Next we should retry the ledger payout webhook before adding new screens.',
+            'created_on': '2024-03-02',
+            'tags': {'backend': 0.88},
+        }
+        stray = {
+            'id': 'chat-stray',
+            'title': 'Sourdough',
+            'text': 'sourdough hydration ratios are unrelated',
+            'summary': 'sourdough hydration',
+            'tags': {},
+        }
+        repo = self._repo()
+        repo['linked_chats'] = [
+            {'chat_id': good['id'], 'fingerprint': ChatLinker.chat_fingerprint(good), 'score': 0.91, 'reason': 'Invoice plan left unfinished.', 'title': good['title'], 'pinned': False},
+            {'chat_id': second['id'], 'fingerprint': ChatLinker.chat_fingerprint(second), 'score': 0.84, 'reason': 'Webhook retry was the next step.', 'title': second['title'], 'pinned': False},
+        ]
+        state.repos = [repo]
+        state.conversations = [good, second, stray]
+
+        prompt = TimeTravelService.generate_master_prompt(repo['id'], None)
+
+        self.assertIn('Unfinished payout flow', prompt)
+        self.assertIn('Webhook retry', prompt)
+        self.assertIn('Invoice plan left unfinished.', prompt)
+        self.assertIn('Webhook retry was the next step.', prompt)
+        self.assertNotIn('sourdough hydration', prompt)
+
+        repo['linked_chats'] = []
+        empty = TimeTravelService.generate_master_prompt(repo['id'], None)
+        self.assertIn('No relevant conversations are linked to this repository.', empty)
+        self.assertNotIn('sourdough hydration', empty)
 
 
 if __name__ == "__main__":

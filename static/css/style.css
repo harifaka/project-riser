@@ -215,6 +215,13 @@ nav {
   margin-bottom: 18px;
 }
 
+.header-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .shell-panel {
   background: rgba(9, 15, 24, 0.72);
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -553,6 +560,9 @@ h1 {
 .tag-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .tag-stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
 .tag-editor-list { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow: auto; }
+.link-list { display: flex; flex-direction: column; gap: 12px; max-height: 420px; overflow: auto; }
+.link-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.link-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .tag-editor-row, .form-row { display: flex; gap: 8px; align-items: center; }
 .reader-text { max-height: 320px; overflow: auto; white-space: pre-wrap; background: var(--bg-dark); padding: 12px; border-radius: 8px; }
 .reader-modal { width: 860px; max-width: 95%; }

@@ -55,11 +55,18 @@
                         <h1>In-Memory Resurrection</h1>
                         <p class="subtitle">Streaming GitHub ZIPs into a virtual RAM cache.</p>
                     </div>
-                    <button class="btn primary" onclick="app.scanRepos()">↻ Sync GitHub</button>
+                    <div class="header-actions">
+                        <button class="btn outline" onclick="app.linkConversations()">Link conversations</button>
+                        <button class="btn primary" onclick="app.scanRepos()">↻ Sync GitHub</button>
+                    </div>
                 </div>
                 <div id="repoProgress" class="progress-block" hidden>
                     <div class="progress-meta"><span id="repoProgressLabel">0%</span></div>
                     <div class="progress-track"><div id="repoProgressBar" class="progress-bar"></div></div>
+                </div>
+                <div id="linkProgress" class="progress-block" hidden>
+                    <div class="progress-meta"><span id="linkProgressLabel">0%</span></div>
+                    <div class="progress-track"><div id="linkProgressBar" class="progress-bar"></div></div>
                 </div>
                 <div id="repoStatus" class="status-text"></div>
                 <details id="scanLogPanel" class="scan-log">
@@ -90,7 +97,7 @@
                 </div>
                 <div id="chatStatus" class="status-text"></div>
                 <div class="chat-tools">
-                    <button class="btn outline" onclick="app.retagChats()">Tagelés újrafuttatása</button>
+                    <button class="btn outline" onclick="app.retagChats()">Retag conversations</button>
                 </div>
                 <div id="chatSummary" class="summary-row"></div>
                 <div id="chatHeatmap" class="heatmap"></div>
@@ -191,7 +198,7 @@
             <div class="form-group"><label>Ollama API URL</label><input type="text" id="ollamaUrl" value="http://localhost:11434"></div>
             <div class="form-group"><label>Ollama Model</label><select id="ollamaModel"></select></div>
             <div class="settings-links">
-                <button class="btn outline" onclick="app.openTagEditor()">Taglista</button>
+                <button class="btn outline" onclick="app.openTagEditor()">Tag list</button>
                 <button class="btn outline" onclick="app.openLayaSettings()">Laya</button>
             </div>
             <div class="modal-actions"><button class="btn outline" onclick="app.toggleSettings()">Close</button><button class="btn primary" onclick="app.saveSettings()">Save Configuration</button></div>
@@ -208,15 +215,15 @@
 
     <div class="modal-backdrop" id="tagModal" style="display:none;">
         <div class="modal">
-            <h2>Taglista</h2>
+            <h2>Tag list</h2>
             <div class="form-row">
-                <input type="text" id="newTagName" placeholder="Új tag">
+                <input type="text" id="newTagName" placeholder="New tag">
                 <input type="color" id="newTagColor" value="#60a5fa">
-                <button class="btn primary" onclick="app.createTag()">Hozzáad</button>
+                <button class="btn primary" onclick="app.createTag()">Add</button>
             </div>
             <div id="tagEditorList" class="tag-editor-list"></div>
             <div class="modal-actions">
-                <button class="btn outline" onclick="app.retagChats()">Tagelés újrafuttatása</button>
+                <button class="btn outline" onclick="app.retagChats()">Retag conversations</button>
                 <button class="btn outline" onclick="document.getElementById('tagModal').style.display='none'">Close</button>
             </div>
         </div>
@@ -224,7 +231,7 @@
 
     <div class="modal-backdrop" id="layaModal" style="display:none;">
         <div class="modal">
-            <h2>Laya kalibráció</h2>
+            <h2>Laya calibration</h2>
             <div class="form-group">
                 <label>Backend</label>
                 <select id="layaBackend">
@@ -235,7 +242,7 @@
                 </select>
             </div>
             <div class="form-group">
-                <label>Modell</label>
+                <label>Model</label>
                 <input type="text" id="layaModel" value="facebook/bart-large-mnli">
             </div>
             <div class="form-group">
@@ -245,18 +252,18 @@
             </div>
             <div class="modal-actions">
                 <button class="btn outline" onclick="document.getElementById('layaModal').style.display='none'">Close</button>
-                <button class="btn primary" onclick="app.saveLayaSettings()">Mentés</button>
+                <button class="btn primary" onclick="app.saveLayaSettings()">Save</button>
             </div>
         </div>
     </div>
 
     <div class="modal-backdrop" id="assignModal" style="display:none;">
         <div class="modal">
-            <h2>Tagek a kijelölésre</h2>
+            <h2>Tags for selection</h2>
             <div id="assignTagList" class="tag-editor-list"></div>
             <div class="modal-actions">
-                <button class="btn outline" onclick="app.submitAssign('unassign')">Levesz</button>
-                <button class="btn primary" onclick="app.submitAssign('assign')">Hozzárendel</button>
+                <button class="btn outline" onclick="app.submitAssign('unassign')">Remove</button>
+                <button class="btn primary" onclick="app.submitAssign('assign')">Assign</button>
                 <button class="btn outline" onclick="document.getElementById('assignModal').style.display='none'">Close</button>
             </div>
         </div>
@@ -264,13 +271,23 @@
 
     <div class="modal-backdrop" id="chatReaderModal" style="display:none;">
         <div class="modal reader-modal">
-            <h2 id="readerTitle">Beszélgetés</h2>
+            <h2 id="readerTitle">Conversation</h2>
             <div id="readerMeta" class="muted"></div>
             <p id="readerSummary"></p>
             <div id="readerTags" class="chip-row"></div>
             <pre id="readerText" class="reader-text"></pre>
             <div class="modal-actions">
                 <button class="btn outline" onclick="document.getElementById('chatReaderModal').style.display='none'">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop" id="linkModal" style="display:none;">
+        <div class="modal">
+            <h2 id="linkModalTitle">Linked conversations</h2>
+            <div id="linkList" class="link-list"></div>
+            <div class="modal-actions">
+                <button class="btn outline" onclick="document.getElementById('linkModal').style.display='none'">Close</button>
             </div>
         </div>
     </div>

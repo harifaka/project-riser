@@ -103,6 +103,10 @@ class StateManager:
         self.chat_retag_in_progress = False
         self.chat_retag_done = 0
         self.chat_retag_total = 0
+        self.link_generation = 0
+        self.link_in_progress = False
+        self.link_done = 0
+        self.link_total = 0
         self._dirty_writes = 0
         self._save_timer = None
         self.work_gate = ConcurrencyGate()
@@ -261,6 +265,10 @@ class StateManager:
         with self.lock:
             return generation == self.scan_generation
 
+    def is_current_link(self, generation):
+        with self.lock:
+            return generation == self.link_generation
+
     def reset_scan(self):
         self.start_scan_generation()
 
@@ -341,6 +349,8 @@ def public_repo(repo):
     record = StateManager._json_safe(dict(repo))
     record.pop('commits', None)
     record['manual_tags'] = list(state.tag_assignments.get('repos', {}).get(str(repo.get('id')), []) or [])
+    record['linked_chats'] = ChatLinker.public_links(repo)
+    record.pop('rejected_chat_fingerprints', None)
     return record
 
 
@@ -357,6 +367,9 @@ def scan_status_payload():
             'total_count': total,
             'analyzed_count': analyzed,
             'cached_count': cached,
+            'link_in_progress': state.link_in_progress,
+            'link_done': state.link_done,
+            'link_total': state.link_total,
             'repos': [public_repo(repo) for repo in ordered],
             'scan_log': list(state.scan_log[-40:]),
         }
@@ -1062,29 +1075,322 @@ class RepoAnalyzer:
         state.log(f"[repo-sync] complete {name}: loc={data['custom_lines']}, mood={mood}, effort={tshirt}, abandoned_days={days_abandoned}")
 
 
+_LINK_STOPWORDS = {
+    'the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'was', 'were', 'you', 'your',
+    'our', 'not', 'but', 'have', 'has', 'had', 'will', 'just', 'into', 'about', 'then', 'than',
+    'them', 'they', 'what', 'when', 'where', 'which', 'while', 'would', 'could', 'should',
+    'there', 'their', 'been', 'being', 'also', 'can', 'its', 'let', 'use', 'using', 'used',
+}
+
+
+class ChatLinker:
+    def __init__(self, ollama_url=None, ollama_model=None):
+        self.ollama_url = ollama_url or state.settings.get('ollama_url')
+        self.ollama_model = ollama_model or state.settings.get('ollama_model')
+
+    @staticmethod
+    def tokenize(text):
+        return {
+            token for token in re.findall(r'[a-z0-9]{3,}', (text or '').lower())
+            if token not in _LINK_STOPWORDS and not token.isdigit()
+        }
+
+    @staticmethod
+    def chat_fingerprint(chat):
+        raw = '|'.join([
+            str(chat.get('title') or ''),
+            str(chat.get('created_on') or ''),
+            str(chat.get('text') or '')[:400],
+        ])
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+    @staticmethod
+    def readme_excerpt(repo):
+        key = repo.get('name') or repo.get('full_name')
+        blob = state.repo_cache.get(key) if key else None
+        if not blob:
+            return ''
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+                for info in archive.infolist():
+                    if info.is_dir() or not info.filename.upper().endswith('README.MD'):
+                        continue
+                    return archive.read(info).decode('utf-8', errors='ignore')[:800]
+        except Exception:
+            return ''
+        return ''
+
+    @staticmethod
+    def dossier_body(repo):
+        parts = [
+            repo.get('description') or '',
+            ' '.join(repo.get('tech_stack') or []),
+            ' '.join(str(item) for item in (repo.get('endpoints') or [])),
+            ' '.join(str(item) for item in (repo.get('todos') or [])),
+            ChatLinker.readme_excerpt(repo),
+        ]
+        return '\n'.join(str(part) for part in parts if part)
+
+    @staticmethod
+    def _scores_above_confidence(scores):
+        threshold = confidence_ratio()
+        kept = {}
+        for key, value in (scores or {}).items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number >= threshold:
+                kept[str(key).lower()] = number
+        return kept
+
+    @staticmethod
+    def laya_overlap(repo, chat):
+        repo_scores = ChatLinker._scores_above_confidence(repo.get('tags'))
+        chat_scores = ChatLinker._scores_above_confidence(chat.get('tags'))
+        shared = set(repo_scores) & set(chat_scores)
+        if not shared:
+            return 0.0
+        return sum(min(repo_scores[key], chat_scores[key]) for key in shared) / len(shared)
+
+    @staticmethod
+    def cheap_score(repo, chat):
+        body_tokens = ChatLinker.tokenize(ChatLinker.dossier_body(repo))
+        chat_tokens = ChatLinker.tokenize(' '.join([
+            chat.get('title') or '',
+            chat.get('summary') or '',
+            chat.get('text') or '',
+        ]))
+        overlap = body_tokens & chat_tokens
+        if body_tokens and overlap:
+            word = min(1.0, len(overlap) / min(6, len(body_tokens)))
+        else:
+            word = 0.0
+        score = (0.5 * ChatLinker.laya_overlap(repo, chat)) + (0.5 * word)
+        name = (repo.get('full_name') or repo.get('name') or '').split('/')[-1]
+        name_tokens = ChatLinker.tokenize(name)
+        if name_tokens and name_tokens <= chat_tokens and score >= 0.2:
+            score = min(1.0, score + 0.05)
+        return round(score, 3), overlap
+
+    @staticmethod
+    def overlap_reason(overlap):
+        words = ', '.join(sorted(overlap)[:4])
+        if not words:
+            return 'This conversation matches how the repository behaves, not only its name.'
+        return f'This conversation follows the same unfinished work on {words}.'
+
+    def llm_decision(self, repo, chat, cheap_score, overlap):
+        prompt = (
+            'Decide whether this conversation is about the same unfinished project as the repository. '
+            'A shared name is not enough; match on behavior, features, and the plan that was left unfinished. '
+            'Reply with JSON only: {"match": <number from 0 to 1>, "reason": "<one English sentence>"}.\n'
+            f'Repository:\n{ChatLinker.dossier_body(repo)[:1500]}\n\n'
+            f'Conversation title: {chat.get("title") or ""}\n'
+            f'Summary: {chat.get("summary") or ""}\n'
+            f'Excerpt:\n{(chat.get("text") or "")[:1200]}'
+        )
+        raw = LLMService.ask(prompt, self.ollama_url, self.ollama_model)
+        parsed = ChatLinker.parse_decision(raw)
+        if parsed is None:
+            return {'match': cheap_score, 'reason': ChatLinker.overlap_reason(overlap)}
+        return parsed
+
+    @staticmethod
+    def parse_decision(raw):
+        match = re.search(r'\{.*\}', raw or '', flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:
+            return None
+        if not isinstance(payload, dict) or 'match' not in payload:
+            return None
+        try:
+            score = float(payload.get('match'))
+        except (TypeError, ValueError):
+            return None
+        reason = re.sub(r'\s+', ' ', str(payload.get('reason') or '')).strip()
+        if not reason:
+            reason = 'This conversation describes the same unfinished project behavior.'
+        return {'match': round(min(1.0, max(0.0, score)), 3), 'reason': reason}
+
+    def propose_links(self, repo, chats, confirmer=None):
+        rejected = set(repo.get('rejected_chat_fingerprints') or [])
+        candidates = []
+        threshold = confidence_ratio()
+        for chat in chats:
+            fingerprint = ChatLinker.chat_fingerprint(chat)
+            if fingerprint in rejected:
+                continue
+            score, overlap = ChatLinker.cheap_score(repo, chat)
+            if score < threshold:
+                continue
+            candidates.append((chat, score, overlap, fingerprint))
+
+        accepted = []
+        chunk = max(1, int(state.settings.get('chunk_size', 5)))
+        for start in range(0, len(candidates), chunk):
+            batch = candidates[start:start + chunk]
+            decisions = self._decide_batch(repo, batch, confirmer)
+            for (chat, _score, overlap, fingerprint), decision in zip(batch, decisions):
+                try:
+                    match = float((decision or {}).get('match') or 0)
+                except (TypeError, ValueError):
+                    match = 0.0
+                if match < threshold:
+                    continue
+                accepted.append({
+                    'chat_id': chat.get('id'),
+                    'fingerprint': fingerprint,
+                    'score': round(match, 3),
+                    'reason': (decision or {}).get('reason') or ChatLinker.overlap_reason(overlap),
+                    'title': chat.get('title') or 'Conversation',
+                    'pinned': False,
+                })
+        accepted.sort(key=lambda item: float(item.get('score') or 0), reverse=True)
+        return accepted
+
+    def _decide_batch(self, repo, batch, confirmer):
+        if confirmer is not None or len(batch) <= 1:
+            return [self._decide_one(repo, item, confirmer) for item in batch]
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            futures = [pool.submit(self._decide_one, repo, item, None) for item in batch]
+            return [future.result() for future in futures]
+
+    def _decide_one(self, repo, item, confirmer):
+        chat, score, overlap, _fingerprint = item
+        if confirmer is not None:
+            return confirmer(repo, chat, score) or {'match': 0, 'reason': ''}
+        return self.llm_decision(repo, chat, score, overlap)
+
+    @staticmethod
+    def merge_links(existing, auto_links, rejected):
+        rejected = set(rejected or [])
+        pinned = []
+        pinned_fps = set()
+        for link in existing or []:
+            fingerprint = link.get('fingerprint')
+            if not link.get('pinned') or not fingerprint or fingerprint in rejected:
+                continue
+            pinned.append(dict(link))
+            pinned_fps.add(fingerprint)
+        merged = list(pinned)
+        for link in auto_links or []:
+            fingerprint = link.get('fingerprint')
+            if not fingerprint or fingerprint in rejected or fingerprint in pinned_fps:
+                continue
+            merged.append(dict(link))
+        merged.sort(key=lambda item: (bool(item.get('pinned')), float(item.get('score') or 0)), reverse=True)
+        return merged
+
+    @staticmethod
+    def find_chat(link):
+        fingerprint = link.get('fingerprint')
+        chat_id = str(link.get('chat_id') or '')
+        by_id = next((chat for chat in state.conversations if str(chat.get('id')) == chat_id), None)
+        if by_id is not None and ChatLinker.chat_fingerprint(by_id) == fingerprint:
+            return by_id
+        if fingerprint:
+            matched = next((chat for chat in state.conversations if ChatLinker.chat_fingerprint(chat) == fingerprint), None)
+            if matched is not None:
+                link['chat_id'] = matched.get('id')
+                link['title'] = matched.get('title') or link.get('title')
+                return matched
+        return by_id
+
+    @staticmethod
+    def public_links(repo):
+        visible = []
+        for link in repo.get('linked_chats') or []:
+            chat = ChatLinker.find_chat(link)
+            visible.append({
+                'chat_id': (chat or {}).get('id') or link.get('chat_id'),
+                'fingerprint': link.get('fingerprint'),
+                'title': (chat or {}).get('title') or link.get('title') or 'Conversation unavailable',
+                'score': link.get('score'),
+                'reason': link.get('reason') or '',
+                'pinned': bool(link.get('pinned')),
+                'available': chat is not None,
+            })
+        return visible
+
+    @staticmethod
+    def rebind_loaded_chats():
+        for repo in state.repos:
+            for link in repo.get('linked_chats') or []:
+                ChatLinker.find_chat(link)
+
+    def run(self, generation):
+        with state.lock:
+            repo_ids = [repo.get('id') for repo in state.repos if repo.get('status') == 'ready']
+        for repo_id in repo_ids:
+            if not state.is_current_link(generation):
+                return
+            with state.lock:
+                repo = next((item for item in state.repos if str(item.get('id')) == str(repo_id)), None)
+                chats = list(state.conversations)
+                if repo is None:
+                    continue
+                snapshot = dict(repo)
+            auto_links = self.propose_links(snapshot, chats)
+            flush_now = False
+            with state.lock:
+                if not state.is_current_link(generation):
+                    return
+                current = next((item for item in state.repos if str(item.get('id')) == str(repo_id)), None)
+                if current is not None:
+                    rejected = set(current.get('rejected_chat_fingerprints') or [])
+                    current['linked_chats'] = ChatLinker.merge_links(current.get('linked_chats'), auto_links, rejected)
+                    state.link_done += 1
+                    flush_now = state.note_scan_dirty()
+            if flush_now:
+                state.flush_scan_cache()
+        finished = False
+        with state.lock:
+            if state.is_current_link(generation):
+                state.link_in_progress = False
+                state.link_done = state.link_total
+                finished = True
+        if finished:
+            state.log(f'[linker] linked conversations across {len(repo_ids)} repos')
+            state.flush_scan_cache()
+
+
 class TimeTravelService:
     @staticmethod
-    def best_chat_for_repo(repo):
-        best = None
-        best_score = -1
-        repo_tags = set((repo.get('tags') or {}).keys())
-        for chat in state.conversations:
-            chat_tags = set((chat.get('tags') or {}).keys())
-            score = len(repo_tags & chat_tags)
-            if score > best_score:
-                best = chat
-                best_score = score
-        return best
+    def linked_memory(repo):
+        links = repo.get('linked_chats') or []
+        if not links:
+            return 'No relevant conversations are linked to this repository.'
+        blocks = []
+        for link in links:
+            chat = ChatLinker.find_chat(link)
+            title = (chat or {}).get('title') or link.get('title') or 'Conversation'
+            created = (chat or {}).get('created_on') or 'undated'
+            summary = (chat or {}).get('summary') or ''
+            excerpt = ((chat or {}).get('text') or '')[:600]
+            if chat is None:
+                excerpt = 'The conversation text is not loaded in this session.'
+            blocks.append(
+                f"### {title}\n"
+                f"Date: {created}\n"
+                f"Why it matches: {link.get('reason') or ''}\n"
+                f"Summary: {summary}\n"
+                f"Plan excerpt:\n{excerpt}"
+            )
+        return '\n\n'.join(blocks)
 
     @staticmethod
     def generate_master_prompt(repo_id, token):
         repo = next((r for r in state.repos if str(r['id']) == str(repo_id)), None)
         if not repo:
             return 'Repo not found in state.'
-        best_chat = TimeTravelService.best_chat_for_repo(repo)
+        chat_context = TimeTravelService.linked_memory(repo)
 
         zip_content = state.repo_cache.get(repo['name'])
-        if not zip_content:
+        if not zip_content and token:
             resp = requests.get(f"https://api.github.com/repos/{repo['name']}/zipball", headers={'Authorization': f'token {token}'})
             if resp.status_code == 200:
                 zip_content = resp.content
@@ -1100,7 +1406,6 @@ class TimeTravelService:
                     if info.filename.endswith(('main.py', 'index.js', 'app.py', 'App.js')) and not main_code:
                         main_code = z.read(info).decode('utf-8', errors='ignore')[:1000]
 
-        chat_context = f"We were discussing: {best_chat['text'][-1000:]}\nThe AI conversation ended because: {best_chat['closure_reason']}" if best_chat else 'No prior AI conversations linked.'
         prompt = f"""# TIME TRAVEL MASTER PROMPT
 **Role:** You are a senior AI coding assistant. We are resuming development on an abandoned project. You must act as if no time has passed.
 
@@ -1125,7 +1430,7 @@ class TimeTravelService:
 {chr(10).join(['- ' + t for t in repo.get('todos', [])])}
 
 ## 4. Your Mission
-Based on the code state and the past AI conversation, please provide:
+Based on the code state and the linked conversations, please provide:
 1. A brief summary of where we left off.
 2. The exact, specific next step (a single task) I need to code right now to get back into the flow. Do not give me a massive list, just the next logical block.
 """
@@ -1275,6 +1580,7 @@ def upload_chats():
         for chat in parsed:
             chat['source_file'] = safe_name
         state.conversations.extend(parsed)
+        ChatLinker.rebind_loaded_chats()
         uploaded_count += len(parsed)
         state.chat_files = [f for f in state.chat_files if f['name'] != safe_name]
         state.chat_files.append({'name': safe_name, 'size': len(file_content), 'uploaded_at': datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')})
@@ -1352,6 +1658,8 @@ def scan_github():
                     'smells': (cached or {}).get('smells'),
                     'mood': (cached or {}).get('mood'),
                     'tshirt': (cached or {}).get('tshirt'),
+                    'linked_chats': list((cached or {}).get('linked_chats') or []),
+                    'rejected_chat_fingerprints': list((cached or {}).get('rejected_chat_fingerprints') or []),
                 }
                 dirty.append(profile)
             profiles.append(profile)
@@ -1508,6 +1816,68 @@ def chat_detail(chat_id):
         'visible_tags': visible,
         'manual_tags': list(state.tag_assignments.get('chats', {}).get(str(chat_id), []) or []),
     })
+
+
+def _repo_by_id(repo_id):
+    return next((repo for repo in state.repos if str(repo.get('id')) == str(repo_id)), None)
+
+
+def _link_in_repo(repo, fingerprint):
+    return next((link for link in (repo.get('linked_chats') or []) if link.get('fingerprint') == fingerprint), None)
+
+
+@app.route('/api/link_chats', methods=['POST'])
+def link_chats():
+    payload = request.get_json(silent=True) or {}
+    with state.lock:
+        ready = [repo for repo in state.repos if repo.get('status') == 'ready']
+        if state.link_in_progress:
+            return jsonify(scan_status_payload())
+        if not state.conversations:
+            return jsonify({'error': 'Import conversations before linking.'}), 400
+        if not ready:
+            return jsonify({'error': 'No ready repositories to link.'}), 400
+        state.link_generation += 1
+        generation = state.link_generation
+        state.link_total = len(ready)
+        state.link_done = 0
+        state.link_in_progress = True
+    state.log(f'[linker] matching conversations to {len(ready)} repos')
+    linker = ChatLinker(payload.get('ollama_url'), payload.get('ollama_model'))
+    executor.submit(linker.run, generation)
+    payload_out = scan_status_payload()
+    payload_out['status'] = 'started'
+    return jsonify(payload_out)
+
+
+@app.route('/api/repos/<repo_id>/links/<fingerprint>', methods=['POST'])
+def update_repo_link(repo_id, fingerprint):
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get('action') or '').strip().lower()
+    if action not in ('unlink', 'pin', 'unpin'):
+        return jsonify({'error': 'Action must be unlink, pin, or unpin.'}), 400
+    flush_now = False
+    with state.lock:
+        repo = _repo_by_id(repo_id)
+        if repo is None:
+            return jsonify({'error': 'Repo not found.'}), 404
+        links = list(repo.get('linked_chats') or [])
+        link = _link_in_repo(repo, fingerprint)
+        if link is None:
+            return jsonify({'error': 'Link not found.'}), 404
+        if action == 'unlink':
+            rejected = set(repo.get('rejected_chat_fingerprints') or [])
+            rejected.add(fingerprint)
+            repo['rejected_chat_fingerprints'] = sorted(rejected)
+            repo['linked_chats'] = [item for item in links if item.get('fingerprint') != fingerprint]
+        else:
+            link['pinned'] = action == 'pin'
+        flush_now = state.note_scan_dirty()
+    if flush_now:
+        state.flush_scan_cache()
+    else:
+        state.flush_scan_cache()
+    return jsonify({'status': 'success', 'repo': public_repo(_repo_by_id(repo_id))})
 
 
 @app.route('/api/time_travel/<repo_id>', methods=['POST'])

@@ -36,11 +36,15 @@ The repo graveyard includes:
 
 The chat pipeline accepts ChatGPT JSON and Gemini HTML/JSON exports and keeps the original content in RAM. On import it stores a short summary, a closure label (`SOLVED`, `CONTEXT_LOST`, `TIMEOUT`), a calendar day when the export has one, and Laya scores for every current tag.
 
-The Chat tab can be read while tagging runs. It shows a source and closure summary, a GitHub-style day heatmap, and a reverse count of how many conversations match each tag at the confidence threshold. Opening a conversation shows the summary and the stored text. **Tagelés újrafuttatása** rescores every loaded conversation against the current tag list and does not start a GitHub sync. Manual tag assignments stay unless that tag was removed.
+The Chat tab can be read while tagging runs. It shows a source and closure summary, a GitHub-style day heatmap, and a reverse count of how many conversations match each tag at the confidence threshold. Opening a conversation shows the summary and the stored text. **Retag conversations** rescores every loaded conversation against the current tag list and does not start a GitHub sync. Manual tag assignments stay unless that tag was removed.
 
 ## Taxonomy and linking
 
 The app maintains a single global taxonomy. Settings opens a tag-list modal for create, rename, and delete, and a separate Laya modal for backend (`auto`, `transformers`, `ollama`, `keyword`), model id, and the confidence slider. Repo and chat cards can be multi-selected and bulk-assigned. Laya scores each conversation and each analyzed repo against that tag list. `auto` tries the optional transformers zero-shot model, then Ollama JSON scores, then keyword overlap.
+
+**Link conversations** matches loaded chats to ready repositories by how the project behaves, not by its current name. A cheap pass keeps pairs whose Laya scores and wording overlap above the confidence threshold. Only those candidates go to the LLM, in batches of the configured chunk size, for a match score and a one-sentence reason. One repo can keep several conversations, and one conversation can match more than one repo. The results are stored on the repo as ids, scores, reasons, and a fingerprint of the title, date, and text prefix, then written with the batched scan cache. The chat body stays in memory. Unlink keeps a conversation off that repo on later runs. Pin keeps a link even if the next run would drop it.
+
+Each repo card shows how many conversations are linked. Opening the list shows the title, reason, and score, with Open, Pin, and Unlink. Time Travel builds the past-memory section from those linked plans. If nothing is linked, the prompt says so and does not pull in an unrelated chat. GitHub sync does not start this matching pass.
 
 ## Analytics
 

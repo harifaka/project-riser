@@ -71,7 +71,9 @@ The extracted fields are written to the lightweight JSON snapshot and are not th
 
 - CSV and welcome-back exports are streamed from memory.
 - Download generation avoids output/ files and does not persist those artifacts to disk.
-- Time Travel prompts are generated from the in-memory repo state and the best-matching chat context.
+- Time Travel prompts are generated from the in-memory repo state and the conversations linked to that repo.
+- **Link conversations** runs separately from GitHub sync. It keeps chats whose behavior overlaps the repo dossier above the confidence threshold, then asks the LLM only for those candidates. Several chats can attach to one repo. Links persist in the scan snapshot by fingerprint, without the chat body. Unlink and pin override the next automatic pass.
+- If a repo has no linked conversations, Time Travel says so and does not insert an unrelated chat.
 
 ## 8. Settings & operations
 
@@ -96,12 +98,13 @@ The project currently ships the following core behavior:
 - tag editor and bulk assign or unassign
 - chat reader with heatmap, summary, and per-tag counts
 - conversation retag independent of GitHub sync
+- behavior-based conversation linking, with pin and unlink, feeding Time Travel
 
 ## Open items
 
 - Chat modal for editing topic splits and complexity by hand.
 - More framework-specific extraction and route heuristics.
-- CSV and welcome-back export panels, and an AI Linker view in the front end.
+- CSV and welcome-back export panels, and a separate AI Linker view. Conversation linking already runs from the repository header and each repo card.
 - Settings controls for chunk size and description word budget. The server already stores both.
 
 

@@ -4,6 +4,8 @@ const app = {
     tags: [],
     confidence: 70,
     assignTarget: 'repos',
+    repoMap: {},
+    linkRepoId: null,
     init() {
         const urlField = document.getElementById('ollamaUrl');
         const savedUrl = localStorage.getItem('ollamaUrl');
@@ -217,8 +219,8 @@ const app = {
             <div class="tag-editor-row" data-tag-id="${tag.id}">
                 <input type="color" value="${tag.color || '#60a5fa'}" data-role="color">
                 <input type="text" value="${this.escape(tag.name)}" data-role="name">
-                <button class="btn outline" data-action="save">Mentés</button>
-                <button class="btn outline" data-action="delete">Törlés</button>
+                <button class="btn outline" data-action="save">Save</button>
+                <button class="btn outline" data-action="delete">Delete</button>
             </div>
         `).join('');
         list.querySelectorAll('.tag-editor-row').forEach(row => {
@@ -317,6 +319,7 @@ const app = {
         const repoRes = await fetch('/api/repos');
         const rData = await repoRes.json();
         this.renderRepoProgress(rData);
+        this.renderLinkProgress(rData);
         this.renderRepos(rData.repos || []);
         if (document.getElementById('chatsTab').style.display !== 'none') {
             await this.pollChats();
@@ -333,15 +336,50 @@ const app = {
         block.hidden = false;
         const pct = Math.round((analyzed / total) * 100);
         document.getElementById('repoProgressBar').style.width = pct + '%';
-        document.getElementById('repoProgressLabel').textContent = `${pct}% · ${analyzed}/${total} kész · ${data.cached_count || 0} cache`;
+        document.getElementById('repoProgressLabel').textContent = `${pct}% · ${analyzed}/${total} ready · ${data.cached_count || 0} cached`;
         const lines = (data.scan_log || []).map(entry => entry.message).join('\n');
         document.getElementById('scanLog').textContent = lines;
     },
+    renderLinkProgress(data) {
+        const block = document.getElementById('linkProgress');
+        const total = data.link_total || 0;
+        if (!data.link_in_progress || !total) {
+            block.hidden = true;
+            return;
+        }
+        block.hidden = false;
+        const done = data.link_done || 0;
+        const pct = Math.round((done / total) * 100);
+        document.getElementById('linkProgressBar').style.width = pct + '%';
+        document.getElementById('linkProgressLabel').textContent = `${pct}% · ${done}/${total} repos`;
+    },
+    async linkConversations() {
+        const status = document.getElementById('repoStatus');
+        status.innerText = 'Linking conversations...';
+        const res = await fetch('/api/link_chats', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                ollama_url: localStorage.getItem('ollamaUrl') || 'http://localhost:11434',
+                ollama_model: localStorage.getItem('ollamaModel') || 'llama3.1',
+            }),
+        });
+        const data = await res.json();
+        if (data.error) {
+            status.innerText = data.error;
+            return;
+        }
+        status.innerText = 'Linking conversations...';
+        this.renderLinkProgress(data);
+        this.renderRepos(data.repos || []);
+    },
     renderRepos(repos) {
         const c = document.getElementById('repoContainer');
+        this.repoMap = {};
         const seen = new Set();
-        repos.forEach(repo => {
+            repos.forEach(repo => {
             const id = String(repo.id);
+            this.repoMap[id] = repo;
             seen.add(id);
             let card = c.querySelector(`[data-repo-id="${id}"]`);
             if (!card) {
@@ -355,6 +393,7 @@ const app = {
                     <div class="chip-row" data-field="badges"></div>
                     <div class="chip-row" data-field="tags"></div>
                     <div class="card-desc" data-field="description"></div>
+                    <button type="button" class="btn outline full links-btn"></button>
                     <button class="btn outline full travel-btn" style="border-color:var(--primary); color:var(--primary);">⏳ Gen Time Travel Prompt</button>
                 `;
                 card.querySelector('input').addEventListener('change', (event) => {
@@ -362,6 +401,7 @@ const app = {
                     else this.selectedRepos.delete(id);
                     this.updateBulk('repos');
                 });
+                card.querySelector('.links-btn').addEventListener('click', () => this.openLinks(id));
                 card.querySelector('.travel-btn').addEventListener('click', (event) => this.generateTimeTravel(id, event));
                 c.appendChild(card);
             }
@@ -375,6 +415,9 @@ const app = {
             `;
             card.querySelector('[data-field="tags"]').innerHTML = this.visibleTags(repo).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
             card.querySelector('[data-field="description"]').textContent = repo.description || '';
+            const links = repo.linked_chats || [];
+            const linkButton = card.querySelector('.links-btn');
+            linkButton.textContent = links.length === 1 ? '1 conversation' : `${links.length} conversations`;
             const button = card.querySelector('.travel-btn');
             button.disabled = status !== 'ready';
             card.querySelector('input').checked = this.selectedRepos.has(id);
@@ -382,6 +425,65 @@ const app = {
         c.querySelectorAll('[data-repo-id]').forEach(card => {
             if (!seen.has(card.dataset.repoId)) card.remove();
         });
+        if (this.linkRepoId && document.getElementById('linkModal').style.display === 'flex') {
+            this.renderLinkList(this.linkRepoId);
+        }
+    },
+    openLinks(repoId) {
+        this.linkRepoId = String(repoId);
+        this.renderLinkList(this.linkRepoId);
+        document.getElementById('linkModal').style.display = 'flex';
+    },
+    renderLinkList(repoId) {
+        const repo = this.repoMap[String(repoId)];
+        const title = document.getElementById('linkModalTitle');
+        const list = document.getElementById('linkList');
+        if (!repo) {
+            title.textContent = 'Linked conversations';
+            list.innerHTML = '<div class="muted">No conversations linked.</div>';
+            return;
+        }
+        const name = (repo.name || '').split('/').pop() || repo.name || 'Repository';
+        title.textContent = `Linked conversations · ${name}`;
+        const links = repo.linked_chats || [];
+        if (!links.length) {
+            list.innerHTML = '<div class="muted">No conversations linked.</div>';
+            return;
+        }
+        list.innerHTML = links.map(link => `
+            <div class="link-row" data-fingerprint="${this.escape(link.fingerprint || '')}">
+                <div>
+                    <strong>${this.escape(link.title || 'Conversation')}</strong>
+                    <div class="muted">${this.escape(link.reason || '')}</div>
+                    <div class="muted">Score ${this.escape(String(link.score ?? ''))}${link.pinned ? ' · pinned' : ''}</div>
+                </div>
+                <div class="link-actions">
+                    <button type="button" class="btn outline" data-action="open" ${link.available ? '' : 'disabled'}>Open</button>
+                    <button type="button" class="btn outline" data-action="pin">${link.pinned ? 'Unpin' : 'Pin'}</button>
+                    <button type="button" class="btn outline" data-action="unlink">Unlink</button>
+                </div>
+            </div>
+        `).join('');
+        list.querySelectorAll('.link-row').forEach(row => {
+            const fingerprint = row.dataset.fingerprint;
+            const link = links.find(item => item.fingerprint === fingerprint);
+            row.querySelector('[data-action="open"]').addEventListener('click', () => {
+                if (link && link.chat_id) this.openChat(link.chat_id);
+            });
+            row.querySelector('[data-action="pin"]').addEventListener('click', () => {
+                this.updateLink(fingerprint, link && link.pinned ? 'unpin' : 'pin');
+            });
+            row.querySelector('[data-action="unlink"]').addEventListener('click', () => this.updateLink(fingerprint, 'unlink'));
+        });
+    },
+    async updateLink(fingerprint, action) {
+        if (!this.linkRepoId || !fingerprint) return;
+        await fetch(`/api/repos/${encodeURIComponent(this.linkRepoId)}/links/${encodeURIComponent(fingerprint)}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action}),
+        });
+        await this.pollData();
     },
     visibleTags(entity) {
         const threshold = (Number(this.confidence) || 0) / 100;
@@ -436,12 +538,14 @@ const app = {
         block.hidden = false;
         const pct = Math.round((data.retag_done / data.retag_total) * 100);
         document.getElementById('chatProgressBar').style.width = pct + '%';
-        document.getElementById('chatProgressLabel').textContent = `${pct}% · ${data.retag_done}/${data.retag_total} címkézve`;
+        document.getElementById('chatProgressLabel').textContent = `${pct}% · ${data.retag_done}/${data.retag_total} tagged`;
     },
     renderChatSummary(data) {
-        const sources = Object.entries(data.sources || {}).map(([name, count]) => `${count} ${name}`).join(' · ') || 'nincs forrás';
+        const sources = Object.entries(data.sources || {}).map(([name, count]) => `${count} ${name}`).join(' · ') || 'no source';
         const closures = Object.entries(data.closures || {}).map(([name, count]) => `${count} ${name}`).join(' · ');
-        document.getElementById('chatSummary').textContent = `${data.total || 0} beszélgetés · ${sources} · dátumozott ${data.dated || 0} · dátum nélkül ${data.undated || 0}${closures ? ' · ' + closures : ''}`;
+        const count = data.total || 0;
+        const noun = count === 1 ? 'conversation' : 'conversations';
+        document.getElementById('chatSummary').textContent = `${count} ${noun} · ${sources} · dated ${data.dated || 0} · undated ${data.undated || 0}${closures ? ' · ' + closures : ''}`;
     },
     renderHeatmap(days) {
         const host = document.getElementById('chatHeatmap');
@@ -476,7 +580,7 @@ const app = {
                     <div class="chip-row" data-field="meta"></div>
                     <div class="chip-row" data-field="tags"></div>
                     <div class="card-desc" data-field="summary"></div>
-                    <button class="btn outline full read-btn">Olvasás</button>
+                    <button class="btn outline full read-btn">Read</button>
                 `;
                 card.querySelector('input').addEventListener('change', (event) => {
                     if (event.target.checked) this.selectedChats.add(id);
@@ -489,7 +593,7 @@ const app = {
             card.querySelector('[data-field="title"]').textContent = chat.title || 'Imported Chat';
             card.querySelector('[data-field="meta"]').innerHTML = `
                 <span class="badge">${this.escape(chat.source || '')}</span>
-                <span class="badge">${this.escape(chat.created_on || 'dátum nélkül')}</span>
+                <span class="badge">${this.escape(chat.created_on || 'undated')}</span>
                 <span class="badge">${this.escape(chat.closure_reason || '')}</span>
             `;
             card.querySelector('[data-field="tags"]').innerHTML = (chat.tags || []).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
@@ -503,15 +607,15 @@ const app = {
     async openChat(id) {
         const res = await fetch(`/api/chats/${encodeURIComponent(id)}`);
         const data = await res.json();
-        document.getElementById('readerTitle').textContent = data.title || 'Beszélgetés';
-        document.getElementById('readerMeta').textContent = `${data.source || ''} · ${data.created_on || 'dátum nélkül'} · ${data.closure_reason || ''}`;
+        document.getElementById('readerTitle').textContent = data.title || 'Conversation';
+        document.getElementById('readerMeta').textContent = `${data.source || ''} · ${data.created_on || 'undated'} · ${data.closure_reason || ''}`;
         document.getElementById('readerSummary').textContent = data.summary || '';
         document.getElementById('readerTags').innerHTML = (data.visible_tags || []).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
         document.getElementById('readerText').textContent = data.text || '';
         document.getElementById('chatReaderModal').style.display = 'flex';
     },
     async retagChats() {
-        document.getElementById('chatStatus').innerText = 'Tagek újraszámolása...';
+        document.getElementById('chatStatus').innerText = 'Recalculating tags...';
         await fetch('/api/chats/retag', { method: 'POST' });
         this.pollChats();
     },
