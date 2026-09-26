@@ -113,12 +113,14 @@ const app = {
             const backend = document.getElementById('layaBackend');
             const model = document.getElementById('layaModel');
             const confidence = document.getElementById('layaConfidence');
+            const zipToggle = document.getElementById('zipProcessingToggle');
             if (backend) backend.value = settings.laya_backend || 'auto';
             if (model) model.value = settings.laya_model || 'facebook/bart-large-mnli';
             if (confidence) {
                 confidence.value = this.confidence;
                 document.getElementById('layaConfidenceVal').innerText = this.confidence;
             }
+            if (zipToggle) zipToggle.checked = settings.zip_processing_enabled !== false;
         } catch (error) {
             this.tags = [];
         }
@@ -188,7 +190,13 @@ const app = {
         localStorage.setItem('ollamaUrl', url);
         localStorage.setItem('ollamaModel', model);
         localStorage.setItem('cacheSize', document.getElementById('cacheSlider').value);
-        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({cache_size: document.getElementById('cacheSlider').value, ollama_url: url, ollama_model: model}) });
+        const payload = {
+            cache_size: document.getElementById('cacheSlider').value,
+            ollama_url: url,
+            ollama_model: model,
+            zip_processing_enabled: document.getElementById('zipProcessingToggle')?.checked !== false,
+        };
+        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
         this.toggleSettings();
     },
     async openLayaSettings() {

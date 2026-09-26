@@ -120,6 +120,7 @@ class StateManager:
             "laya_model": "facebook/bart-large-mnli",
             "ollama_url": "http://localhost:11434",
             "ollama_model": "llama3.1",
+            "zip_processing_enabled": True,
         }
         self.load_tag_cache()
         self.load_scan_cache()
@@ -920,6 +921,40 @@ class RepoAnalyzer:
             return resp.content
         return None
 
+    def fetch_readme_and_files(self, repo_name):
+        payload = {'readme': '', 'files': [], 'tech_stack': []}
+        try:
+            files_resp = requests.get(f'https://api.github.com/repos/{repo_name}/contents', headers=self.headers, timeout=20)
+            if files_resp.status_code == 200:
+                entries = files_resp.json() or []
+                if isinstance(entries, list):
+                    payload['files'] = [str(item.get('name') or '') for item in entries if isinstance(item, dict) and item.get('name')]
+            readme_resp = requests.get(f'https://api.github.com/repos/{repo_name}/readme', headers=self.headers, timeout=20)
+            if readme_resp.status_code == 200:
+                readme_data = readme_resp.json() or {}
+                content = readme_data.get('content') or ''
+                if content:
+                    try:
+                        import base64
+                        payload['readme'] = base64.b64decode(content).decode('utf-8', errors='ignore')
+                    except Exception:
+                        payload['readme'] = str(content)
+        except Exception:
+            return payload
+        file_names = [str(name).lower() for name in payload['files'] if str(name).strip()]
+        payload['tech_stack'] = sorted({
+            'nodejs' if 'package.json' in file_names else '',
+            'python' if any(name.endswith('requirements.txt') or name.endswith('pyproject.toml') or name.endswith('poetry.lock') for name in file_names) else '',
+            'rust' if 'cargo.toml' in file_names else '',
+            'golang' if 'go.mod' in file_names else '',
+            'docker' if 'dockerfile' in file_names else '',
+            'docker-compose' if any(name.endswith('docker-compose.yml') or name.endswith('compose.yaml') for name in file_names) else '',
+            'react' if any('react' in name for name in file_names) else '',
+            'api' if any('flask' in name or 'fastapi' in name for name in file_names) else '',
+        })
+        payload['tech_stack'] = [item for item in payload['tech_stack'] if item]
+        return payload
+
     @staticmethod
     def _detect_tech_stack(zip_bytes):
         stack = set()
@@ -964,6 +999,9 @@ class RepoAnalyzer:
                         match['status'] = 'analyzing'
                 state.log(f'[repo-sync] starting {name}')
                 repo_data['commits'] = self._recent_commits(name)
+                if not state.settings.get('zip_processing_enabled', True):
+                    self._analyze_lightweight(repo_data, generation, name)
+                    return
                 zip_content = self.fetch_zip(name)
                 if not zip_content:
                     state.log(f'[repo-sync] skipped {name}: zip unavailable')
@@ -973,6 +1011,48 @@ class RepoAnalyzer:
             except Exception as exc:
                 state.log(f'[repo-sync] failed {name}: {exc}')
                 self._finish_repo(repo_data, generation, {'status': 'error', 'description': 'Analysis failed'})
+
+    def _analyze_lightweight(self, repo_data, generation, name):
+        repo_context = self.fetch_readme_and_files(name)
+        readme = (repo_context.get('readme') or '').strip()
+        file_names = repo_context.get('files') or []
+        text = ' '.join(filter(None, [repo_data.get('description') or '', readme]))
+        summary = LLMService.clamp_description(text or f'{name} repository', state.settings.get('description_word_budget', 18))
+        tags = LayaDecisionService().score(readme or text or name)
+        last_update = coerce_datetime(repo_data.get('last_update'))
+        days_abandoned = (datetime.datetime.now(datetime.timezone.utc) - last_update).days if last_update else 0
+        mood = LLMService.ask(f"Analyze the developer's mood from these commits. Are they FRUSTRATED, BORED, or DONE? Reply one word:\n{' '.join(repo_data.get('commits', []))}", self.ollama_url, self.ollama_model)
+        tshirt = LLMService.ask(f"Estimate resurrection effort (S, M, L, XL) based on {len(file_names)} files and the README context. Reply with one letter/word only.", self.ollama_url, self.ollama_model)
+        if not mood:
+            mood = 'DONE'
+        if not tshirt:
+            tshirt = 'M'
+        self._finish_repo(repo_data, generation, {
+            'id': repo_data['id'],
+            'name': name,
+            'full_name': name,
+            'description': summary,
+            'mood': mood,
+            'tshirt': tshirt,
+            'abandon_score': min(100, max(0, int((days_abandoned / 365) * 60))),
+            'days_abandoned': days_abandoned,
+            'custom_lines': 0,
+            'smells': [],
+            'todos': [],
+            'secrets': 0,
+            'tech_stack': sorted(set(repo_context.get('tech_stack') or [])),
+            'env_vars': [],
+            'db_schemas': [],
+            'endpoints': [],
+            'updated_at': repo_data.get('last_update'),
+            'status': 'ready',
+            'tags': tags,
+            'content_hash': repo_data.get('content_hash'),
+            'tag_fingerprint': state.tag_fingerprint(),
+            'cache_hit': False,
+            'readme_excerpt': readme[:2000],
+        })
+        state.log(f"[repo-sync] lightweight scan complete {name}: files={len(file_names)}, readme={len(readme) > 0}")
 
     def _finish_repo(self, repo_data, generation, fields):
         flush_now = False
@@ -1106,6 +1186,9 @@ class ChatLinker:
 
     @staticmethod
     def readme_excerpt(repo):
+        explicit = repo.get('readme_excerpt') or repo.get('readme') or ''
+        if explicit:
+            return str(explicit)[:800]
         key = repo.get('name') or repo.get('full_name')
         blob = state.repo_cache.get(key) if key else None
         if not blob:
@@ -1396,15 +1479,17 @@ class TimeTravelService:
                 zip_content = resp.content
                 state.repo_cache.put(repo['name'], zip_content)
 
-        readme_content = 'No README found.'
+        readme_content = str(repo.get('readme_excerpt') or 'No README found.')
         main_code = ''
-        if zip_content:
+        if readme_content == 'No README found.' and zip_content:
             with zipfile.ZipFile(io.BytesIO(zip_content)) as z:
                 for info in z.infolist():
                     if 'README.md' in info.filename.upper():
                         readme_content = z.read(info).decode('utf-8', errors='ignore')[:1000]
                     if info.filename.endswith(('main.py', 'index.js', 'app.py', 'App.js')) and not main_code:
                         main_code = z.read(info).decode('utf-8', errors='ignore')[:1000]
+        elif not readme_content:
+            readme_content = 'No README found.'
 
         prompt = f"""# TIME TRAVEL MASTER PROMPT
 **Role:** You are a senior AI coding assistant. We are resuming development on an abandoned project. You must act as if no time has passed.
@@ -1539,6 +1624,8 @@ def update_settings():
         state.settings['ollama_url'] = str(payload.get('ollama_url', state.settings['ollama_url']))
     if 'ollama_model' in payload:
         state.settings['ollama_model'] = str(payload.get('ollama_model', state.settings['ollama_model']))
+    if 'zip_processing_enabled' in payload:
+        state.settings['zip_processing_enabled'] = bool(payload.get('zip_processing_enabled', state.settings.get('zip_processing_enabled', True)))
     state.save_tag_cache()
     return jsonify({'status': 'success', 'settings': state.settings})
 

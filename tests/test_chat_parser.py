@@ -211,13 +211,46 @@ class ChatAnalyzerTests(unittest.TestCase):
         text = "one two three four five six seven"
         self.assertEqual(LLMService.clamp_description(text, 4), "one two three four")
 
-    def test_settings_modal_includes_tag_list_editor(self):
+    def test_settings_modal_does_not_repeat_tag_editor_controls(self):
         with app.test_client() as client:
             response = client.get('/')
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn('Tag List Editor', response.get_data(as_text=True))
-        self.assertIn('Add Tag', response.get_data(as_text=True))
+        html = response.get_data(as_text=True)
+        self.assertNotIn('Tag List Editor', html)
+        self.assertNotIn('Add Tag', html)
+        self.assertIn('Edit tags', html)
+
+    @patch("app.executor.submit", side_effect=_idle_submit)
+    @patch("app.Github")
+    @patch("app.requests.get")
+    def test_scan_skips_zip_work_when_disabled_and_uses_readme_metadata(self, mock_get, mock_github, _submit):
+        state.settings['zip_processing_enabled'] = False
+        repo = Mock(
+            id=77,
+            full_name="octo/skipzip",
+            name="skipzip",
+            updated_at=datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc),
+            pushed_at=datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc),
+            size=12,
+            description="A Python API service",
+        )
+        repo.get_commits.return_value = []
+        user = Mock()
+        user.get_repos.return_value = [repo]
+        mock_github.return_value.get_user.return_value = user
+
+        readme_response = Mock(status_code=200)
+        readme_response.json.return_value = {"content": "VGVlZHVkIGJvZHk=", "download_url": "https://example.com/README.md"}
+        mock_get.return_value = readme_response
+
+        with app.test_client() as client:
+            response = client.post("/api/github/scan", json={"token": "abc123", "ollama_url": "http://localhost:11434", "ollama_model": "llama3.1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["repos"][0]["full_name"], "octo/skipzip")
+        self.assertTrue(payload["repos"][0]["status"] in {"pending", "ready"})
 
     @patch("app.executor.submit", side_effect=_idle_submit)
     @patch("app.Github")
