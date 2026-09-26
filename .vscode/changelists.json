@@ -4,10 +4,8 @@
       "name": "Default",
       "files": [
         ".vscode/changelists.json",
-        "tests/test_chat_parser.py",
-        "app.py",
-        "templates/index.html",
         "static/css/style.css",
+        "templates/index.html",
         "static/js/app.js"
       ]
     }

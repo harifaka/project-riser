@@ -7,6 +7,7 @@ const app = {
     repoMap: {},
     linkRepoId: null,
     exportHandles: { ChatGPT: null, Gemini: null },
+    currentTab: 'repos',
     init() {
         const urlField = document.getElementById('ollamaUrl');
         const savedUrl = localStorage.getItem('ollamaUrl');
@@ -21,7 +22,38 @@ const app = {
         this.restoreDirectoryHandles();
         this.listChatFiles();
         this.loadSettings();
-        setInterval(this.pollData.bind(this), 3000);
+        setInterval(() => {
+            if (this.currentTab === 'repos' || this.currentTab === 'laya') {
+                this.pollData();
+            } else {
+                this.pollChats();
+            }
+        }, 3000);
+    },
+    async fetchJson(url, options = {}) {
+        const response = await fetch(url, options);
+        const text = await response.text();
+        if (!response.ok) {
+            let message = 'Request failed.';
+            try {
+                const payload = JSON.parse(text);
+                message = payload.error || payload.message || message;
+            } catch (error) {
+                const fallback = text.replace(/\s+/g, ' ').trim();
+                if (fallback && fallback.length < 200) {
+                    message = fallback;
+                }
+            }
+            throw new Error(message);
+        }
+        if (!text.trim()) return {};
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 200);
+            console.error('Non-JSON response from', url, snippet);
+            throw new Error('The server returned a non-JSON response.');
+        }
     },
     async restoreDirectoryHandles() {
         if (!('indexedDB' in window)) return;
@@ -145,15 +177,11 @@ const app = {
             chats: conversations,
         };
         document.getElementById('chatStatus').innerText = `⏳ Reading ${conversations.length} ${kind} conversations locally...`;
-        const res = await fetch('/api/import_chat_directory', {
+        const data = await this.fetchJson('/api/import_chat_directory', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
         });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.error || 'Unable to import the selected folder.');
-        }
         document.getElementById('chatStatus').innerText = `✅ Imported ${data.count} ${kind} conversations from ${folderHandle.name}.`;
         this.listChatFiles();
         this.pollChats();
@@ -462,8 +490,7 @@ const app = {
         formData.append('ollama_url', localStorage.getItem('ollamaUrl') || 'http://localhost:11434');
         formData.append('ollama_model', localStorage.getItem('ollamaModel') || 'llama3.1');
         document.getElementById('chatStatus').innerText = "⏳ Parsing...";
-        const res = await fetch('/api/upload_chats', { method: 'POST', body: formData });
-        const data = await res.json();
+        const data = await this.fetchJson('/api/upload_chats', { method: 'POST', body: formData });
         document.getElementById('chatStatus').innerText = `✅ Processed ${data.count} chats.`;
         input.value = '';
         this.listChatFiles();
@@ -543,23 +570,21 @@ const app = {
         }).join('');
     },
     async openChat(id) {
-        const res = await fetch(`/api/chats/${encodeURIComponent(id)}`);
-        const data = await res.json();
+        const data = await this.fetchJson(`/api/chats/${encodeURIComponent(id)}`);
         const mediaUrls = await this.loadChatMedia(data);
         this.renderChatReader(data, mediaUrls);
         document.getElementById('chatReaderModal').style.display = 'flex';
     },
     async retagChats() {
         document.getElementById('chatStatus').innerText = 'Recalculating tags...';
-        await fetch('/api/chats/retag', { method: 'POST' });
+        await this.fetchJson('/api/chats/retag', { method: 'POST' });
         this.pollChats();
     },
     async loadTags() {
         const list = document.getElementById('tagListEditor');
         if (!list) return;
         try {
-            const res = await fetch('/api/tags');
-            const data = await res.json();
+            const data = await this.fetchJson('/api/tags');
             const tags = Array.isArray(data.tags) ? data.tags : [];
             list.innerHTML = tags.length ? tags.map(tag => {
                 const color = tag.color || '#60a5fa';
@@ -587,14 +612,18 @@ const app = {
             return;
         }
         const payload = { name, color: colorInput?.value || '#60a5fa' };
-        const res = await fetch('/api/tags', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            alert(data.error || 'Unable to add tag.');
+        try {
+            const data = await this.fetchJson('/api/tags', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            nameInput.value = '';
+            colorInput.value = '#60a5fa';
+            await this.loadTags();
+            return;
+        } catch (error) {
+            alert(error.message || 'Unable to add tag.');
             return;
         }
         nameInput.value = '';
@@ -603,18 +632,16 @@ const app = {
     },
     async deleteTag(tagId) {
         if (!tagId || !confirm('Delete this tag from the shared taxonomy?')) return;
-        const res = await fetch(`/api/tags/${encodeURIComponent(tagId)}`, { method: 'DELETE' });
-        const data = await res.json();
-        if (!res.ok) {
-            alert(data.error || 'Unable to delete tag.');
-            return;
+        try {
+            await this.fetchJson(`/api/tags/${encodeURIComponent(tagId)}`, { method: 'DELETE' });
+            await this.loadTags();
+        } catch (error) {
+            alert(error.message || 'Unable to delete tag.');
         }
-        await this.loadTags();
     },
     async renameTag(tagId) {
         if (!tagId) return;
-        const res = await fetch('/api/tags');
-        const data = await res.json();
+        const data = await this.fetchJson('/api/tags');
         const tag = (data.tags || []).find(item => String(item.id) === String(tagId));
         if (!tag) return;
         const updatedName = window.prompt('Rename tag', tag.name || tag.id || '');
@@ -624,22 +651,20 @@ const app = {
             alert('Tag name is required.');
             return;
         }
-        const putRes = await fetch(`/api/tags/${encodeURIComponent(tagId)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, color: tag.color || '#60a5fa' })
-        });
-        const putData = await putRes.json();
-        if (!putRes.ok) {
-            alert(putData.error || 'Unable to rename tag.');
-            return;
+        try {
+            await this.fetchJson(`/api/tags/${encodeURIComponent(tagId)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, color: tag.color || '#60a5fa' })
+            });
+            await this.loadTags();
+        } catch (error) {
+            alert(error.message || 'Unable to rename tag.');
         }
-        await this.loadTags();
     },
     async loadSettings() {
         try {
-            const res = await fetch('/api/settings');
-            const data = await res.json();
+            const data = await this.fetchJson('/api/settings');
             const settings = data.settings || {};
             this.confidence = Number(settings.confidence ?? 70);
             this.tags = data.tags || [];
@@ -661,8 +686,7 @@ const app = {
     async resolveOllamaUrl() {
         const urlField = document.getElementById('ollamaUrl');
         try {
-            const res = await fetch('/api/ollama/resolve-url');
-            const data = await res.json();
+            const data = await this.fetchJson('/api/ollama/resolve-url');
             const resolved = data.url || 'http://localhost:11434';
             urlField.value = resolved;
             localStorage.setItem('ollamaUrl', resolved);
@@ -686,8 +710,7 @@ const app = {
         select.disabled = true;
 
         try {
-            const res = await fetch(`/api/ollama/models?url=${encodeURIComponent(url)}`);
-            const data = await res.json();
+            const data = await this.fetchJson(`/api/ollama/models?url=${encodeURIComponent(url)}`);
             const models = Array.isArray(data.models) && data.models.length ? data.models : ['llama3.1'];
             select.innerHTML = models.map(model => `<option value="${model}">${model}</option>`).join('');
             const chosen = models.includes(savedModel) ? savedModel : models[0];
@@ -701,11 +724,16 @@ const app = {
         }
     },
     switchTab(tab) {
+        this.currentTab = tab;
         document.getElementById('reposTab').style.display = tab === 'repos' ? 'block' : 'none';
+        document.getElementById('layaTab').style.display = tab === 'laya' ? 'block' : 'none';
         document.getElementById('chatsTab').style.display = tab === 'chats' ? 'block' : 'none';
         document.querySelectorAll('.nav-btn:not(.outline)').forEach(b => b.classList.remove('active'));
-        event.currentTarget.classList.add('active');
+        const button = Array.from(document.querySelectorAll('.nav-btn')).find(node => node.textContent.includes(tab === 'repos' ? 'GitHub Repos' : tab === 'laya' ? 'Laya Scan' : tab === 'chats' ? 'Chat AI Corpus' : ''));
+        if (button) button.classList.add('active');
         if (tab === 'chats') this.pollChats();
+        if (tab === 'laya') this.pollData();
+        if (tab === 'repos') this.pollData();
     },
     async toggleSettings() {
         const m = document.getElementById('settingsModal');
@@ -729,7 +757,7 @@ const app = {
             ollama_model: model,
             zip_processing_enabled: document.getElementById('zipProcessingToggle')?.checked !== false,
         };
-        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+        await this.fetchJson('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
         this.toggleSettings();
     },
     async openLayaSettings() {
@@ -742,7 +770,7 @@ const app = {
             laya_model: document.getElementById('layaModel').value,
             confidence: Number(document.getElementById('layaConfidence').value),
         };
-        await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        await this.fetchJson('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
         this.confidence = body.confidence;
         document.getElementById('layaModal').style.display = 'none';
         this.pollData();
@@ -752,8 +780,7 @@ const app = {
         document.getElementById('tagModal').style.display = 'flex';
     },
     async refreshTagEditor() {
-        const res = await fetch('/api/tags');
-        const data = await res.json();
+        const data = await this.fetchJson('/api/tags');
         this.tags = data.tags || [];
         const list = document.getElementById('tagEditorList');
         list.innerHTML = this.tags.map(tag => `
@@ -774,18 +801,18 @@ const app = {
         const name = document.getElementById('newTagName').value.trim();
         const color = document.getElementById('newTagColor').value;
         if (!name) return;
-        await fetch('/api/tags', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, color}) });
+        await this.fetchJson('/api/tags', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, color}) });
         document.getElementById('newTagName').value = '';
         await this.refreshTagEditor();
     },
     async updateTag(id, row) {
         const name = row.querySelector('[data-role="name"]').value.trim();
         const color = row.querySelector('[data-role="color"]').value;
-        await fetch(`/api/tags/${encodeURIComponent(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, color}) });
+        await this.fetchJson(`/api/tags/${encodeURIComponent(id)}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, color}) });
         await this.refreshTagEditor();
     },
     async deleteTag(id) {
-        await fetch(`/api/tags/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await this.fetchJson(`/api/tags/${encodeURIComponent(id)}`, { method: 'DELETE' });
         await this.refreshTagEditor();
     },
     async scanRepos() {
@@ -794,11 +821,11 @@ const app = {
         const url = localStorage.getItem('ollamaUrl') || 'http://localhost:11434';
         const model = localStorage.getItem('ollamaModel') || 'llama3.1';
         document.getElementById('repoStatus').innerText = "Listing repositories...";
-        const res = await fetch('/api/github/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token, ollama_url: url, ollama_model: model}) });
-        const data = await res.json();
+        const data = await this.fetchJson('/api/github/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token, ollama_url: url, ollama_model: model}) });
         if (data.repos) {
             this.renderRepoProgress(data);
-            this.renderRepos(data.repos);
+            this.renderRepos(data.repos, 'repoContainer');
+            this.renderRepos(data.repos.filter(repo => repo.status === 'ready' || Object.keys(repo.tags || {}).length), 'layaContainer');
         }
         document.getElementById('repoStatus').innerText = data.error || '';
     },
@@ -816,16 +843,14 @@ const app = {
         formData.append('ollama_url', localStorage.getItem('ollamaUrl') || 'http://localhost:11434');
         formData.append('ollama_model', localStorage.getItem('ollamaModel') || 'llama3.1');
         document.getElementById('chatStatus').innerText = "⏳ Parsing...";
-        const res = await fetch('/api/upload_chats', { method: 'POST', body: formData });
-        const data = await res.json();
+        const data = await this.fetchJson('/api/upload_chats', { method: 'POST', body: formData });
         document.getElementById('chatStatus').innerText = `✅ Processed ${data.count} chats.`;
         input.value = '';
         this.listChatFiles();
         this.pollChats();
     },
     async listChatFiles() {
-        const res = await fetch('/api/chat_files');
-        const data = await res.json();
+        const data = await this.fetchJson('/api/chat_files');
         const list = document.getElementById('chatFilesList');
         if (!data.files || !data.files.length) {
             list.innerHTML = '<div class="muted">No uploaded chat files yet.</div>';
@@ -845,31 +870,33 @@ const app = {
         const body = {action, tag_ids, repo_ids: [], chat_ids: []};
         if (this.assignTarget === 'repos') body.repo_ids = [...this.selectedRepos];
         else body.chat_ids = [...this.selectedChats];
-        await fetch('/api/tags/assign', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        await this.fetchJson('/api/tags/assign', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
         document.getElementById('assignModal').style.display = 'none';
         this.pollData();
         this.pollChats();
     },
     async deleteChatFile(name) {
-        const res = await fetch(`/api/chat_files/${encodeURIComponent(name)}`, { method: 'DELETE' });
-        const data = await res.json();
+        const data = await this.fetchJson(`/api/chat_files/${encodeURIComponent(name)}`, { method: 'DELETE' });
         if (data.status === 'success') {
             document.getElementById('chatStatus').innerText = `🗑️ Removed ${data.removed}.`;
             this.listChatFiles();
         }
     },
     async pollData() {
-        const statRes = await fetch('/api/stats');
-        const stats = await statRes.json();
-        document.getElementById('statLoc').innerText = stats.total_loc;
-        document.getElementById('statDead').innerText = stats.abandoned_count;
-        const repoRes = await fetch('/api/repos');
-        const rData = await repoRes.json();
-        this.renderRepoProgress(rData);
-        this.renderLinkProgress(rData);
-        this.renderRepos(rData.repos || []);
-        if (document.getElementById('chatsTab').style.display !== 'none') {
-            await this.pollChats();
+        try {
+            const stats = await this.fetchJson('/api/stats');
+            document.getElementById('statLoc').innerText = stats.total_loc;
+            document.getElementById('statDead').innerText = stats.abandoned_count;
+            const rData = await this.fetchJson('/api/repos');
+            this.renderRepoProgress(rData);
+            this.renderLinkProgress(rData);
+            this.renderRepos(rData.repos || [], 'repoContainer');
+            this.renderRepos((rData.repos || []).filter(repo => repo.status === 'ready' || Object.keys(repo.tags || {}).length), 'layaContainer');
+            if (document.getElementById('chatsTab').style.display !== 'none') {
+                await this.pollChats();
+            }
+        } catch (error) {
+            console.warn('Unable to refresh repo state:', error.message || error);
         }
     },
     renderRepoProgress(data) {
@@ -903,7 +930,7 @@ const app = {
     async linkConversations() {
         const status = document.getElementById('repoStatus');
         status.innerText = 'Linking conversations...';
-        const res = await fetch('/api/link_chats', {
+        const data = await this.fetchJson('/api/link_chats', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
@@ -911,7 +938,6 @@ const app = {
                 ollama_model: localStorage.getItem('ollamaModel') || 'llama3.1',
             }),
         });
-        const data = await res.json();
         if (data.error) {
             status.innerText = data.error;
             return;
@@ -920,8 +946,9 @@ const app = {
         this.renderLinkProgress(data);
         this.renderRepos(data.repos || []);
     },
-    renderRepos(repos) {
-        const c = document.getElementById('repoContainer');
+    renderRepos(repos, containerId = 'repoContainer') {
+        const c = document.getElementById(containerId);
+        if (!c) return;
         this.repoMap = {};
         const seen = new Set();
             repos.forEach(repo => {
@@ -1025,7 +1052,7 @@ const app = {
     },
     async updateLink(fingerprint, action) {
         if (!this.linkRepoId || !fingerprint) return;
-        await fetch(`/api/repos/${encodeURIComponent(this.linkRepoId)}/links/${encodeURIComponent(fingerprint)}`, {
+        await this.fetchJson(`/api/repos/${encodeURIComponent(this.linkRepoId)}/links/${encodeURIComponent(fingerprint)}`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({action}),
@@ -1068,8 +1095,7 @@ const app = {
         `).join('');
     },
     async pollChats() {
-        const res = await fetch('/api/chats/overview');
-        const data = await res.json();
+        const data = await this.fetchJson('/api/chats/overview');
         this.renderChatProgress(data);
         this.renderChatSummary(data);
         this.renderHeatmap(data.heatmap || []);
@@ -1152,8 +1178,7 @@ const app = {
         });
     },
     async openChat(id) {
-        const res = await fetch(`/api/chats/${encodeURIComponent(id)}`);
-        const data = await res.json();
+        const data = await this.fetchJson(`/api/chats/${encodeURIComponent(id)}`);
         document.getElementById('readerTitle').textContent = data.title || 'Conversation';
         document.getElementById('readerMeta').textContent = `${data.source || ''} · ${data.created_on || 'undated'} · ${data.closure_reason || ''}`;
         document.getElementById('readerSummary').textContent = data.summary || '';
@@ -1163,13 +1188,12 @@ const app = {
     },
     async retagChats() {
         document.getElementById('chatStatus').innerText = 'Recalculating tags...';
-        await fetch('/api/chats/retag', { method: 'POST' });
+        await this.fetchJson('/api/chats/retag', { method: 'POST' });
         this.pollChats();
     },
     async generateTimeTravel(repoId, event) {
         const btn = event.currentTarget; const originalText = btn.innerText; btn.innerText = "⏳ Generating...";
-        const res = await fetch(`/api/time_travel/${repoId}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token: localStorage.getItem('ghToken')}) });
-        const data = await res.json();
+        const data = await this.fetchJson(`/api/time_travel/${repoId}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({token: localStorage.getItem('ghToken')}) });
         document.getElementById('ttPromptArea').value = data.prompt;
         document.getElementById('ttModal').style.display = 'flex';
         btn.innerText = originalText;
@@ -1179,8 +1203,7 @@ const app = {
         alert("Copied!");
     },
     async openGraveyardAnalytics() {
-        const res = await fetch('/api/analytics');
-        const data = await res.json();
+        const data = await this.fetchJson('/api/analytics');
         
         document.getElementById('axFresh').innerText = data.coma_index.Fresh;
         document.getElementById('axDecomp').innerText = data.coma_index.Decomposing;

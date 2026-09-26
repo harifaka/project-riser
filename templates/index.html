@@ -30,7 +30,10 @@
 
             <nav>
                 <button class="nav-btn active" onclick="app.switchTab('repos')">
-                    <span>Repository Graveyard</span>
+                    <span>GitHub Repos</span>
+                </button>
+                <button class="nav-btn" onclick="app.switchTab('laya')">
+                    <span>Laya Scan</span>
                 </button>
                 <button class="nav-btn" onclick="app.switchTab('chats')">
                     <span>Chat AI Corpus</span>
@@ -78,7 +81,23 @@
                     <button class="btn outline" onclick="app.openAssign('repos')">Assign tags</button>
                     <button class="btn outline" onclick="app.clearSelection('repos')">Clear</button>
                 </div>
-                <div class="grid" id="repoContainer"></div>
+                <div class="grid scroll-grid" id="repoContainer"></div>
+            </div>
+
+            <div class="main-content" id="layaTab" style="display:none;">
+                <div class="header shell-panel">
+                    <div>
+                        <div class="eyebrow">Laya tagging</div>
+                        <h1>Laya Scan Analysis</h1>
+                        <p class="subtitle">Inspect the GitHub graveyard through the Laya tag model without mixing it with the raw sync list.</p>
+                    </div>
+                    <div class="header-actions">
+                        <button class="btn outline" onclick="app.retagChats()">Retag chats</button>
+                        <button class="btn primary" onclick="app.pollData()">↻ Refresh Laya</button>
+                    </div>
+                </div>
+                <div id="layaStatus" class="status-text"></div>
+                <div class="grid scroll-grid" id="layaContainer"></div>
             </div>
 
             <div class="main-content" id="chatsTab" style="display:none;">
