@@ -6,6 +6,7 @@ const app = {
     assignTarget: 'repos',
     repoMap: {},
     linkRepoId: null,
+    exportHandles: { ChatGPT: null, Gemini: null },
     init() {
         const urlField = document.getElementById('ollamaUrl');
         const savedUrl = localStorage.getItem('ollamaUrl');
@@ -17,9 +18,541 @@ const app = {
         urlField.addEventListener('blur', () => this.refreshOllamaModels());
         this.loadTags();
         this.resolveOllamaUrl();
+        this.restoreDirectoryHandles();
         this.listChatFiles();
         this.loadSettings();
         setInterval(this.pollData.bind(this), 3000);
+    },
+    async restoreDirectoryHandles() {
+        if (!('indexedDB' in window)) return;
+        for (const kind of ['ChatGPT', 'Gemini']) {
+            const handle = await this.getStoredDirectoryHandle(kind);
+            if (!handle) continue;
+            try {
+                const permission = handle.queryPermission ? await handle.queryPermission({ mode: 'read' }) : 'granted';
+                if (permission === 'granted' || permission === 'prompt') {
+                    this.exportHandles[kind] = handle;
+                }
+            } catch (error) {
+                console.warn(`Unable to restore directory permission for ${kind}:`, error);
+            }
+        }
+    },
+    async getStoredDirectoryHandle(kind) {
+        if (!('indexedDB' in window)) return null;
+        return new Promise(resolve => {
+            const request = indexedDB.open('project-riser-directory-handles', 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains('handles')) {
+                    db.createObjectStore('handles', { keyPath: 'kind' });
+                }
+            };
+            request.onsuccess = () => {
+                const db = request.result;
+                const tx = db.transaction('handles', 'readonly');
+                const store = tx.objectStore('handles');
+                const query = store.get(kind);
+                query.onsuccess = () => resolve(query.result ? query.result.handle : null);
+                query.onerror = () => resolve(null);
+            };
+            request.onerror = () => resolve(null);
+        });
+    },
+    async persistDirectoryHandle(kind, handle) {
+        if (!handle || !('indexedDB' in window)) return;
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open('project-riser-directory-handles', 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains('handles')) {
+                    db.createObjectStore('handles', { keyPath: 'kind' });
+                }
+            };
+            request.onsuccess = () => {
+                const db = request.result;
+                const tx = db.transaction('handles', 'readwrite');
+                const store = tx.objectStore('handles');
+                store.put({ kind, handle });
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error || new Error('Unable to save directory handle.'));
+            };
+            request.onerror = () => reject(request.error || new Error('Unable to open the directory handle store.'));
+        });
+    },
+    async requestDirectoryPermission(handle) {
+        if (!handle || !handle.queryPermission) return true;
+        try {
+            const status = await handle.queryPermission({ mode: 'read' });
+            if (status === 'granted') return true;
+            if (status === 'denied') {
+                alert('The browser denied access to that folder. Please re-select it and allow read permission.');
+                return false;
+            }
+            const requested = await handle.requestPermission({ mode: 'read' });
+            if (requested !== 'granted') {
+                alert('Folder access was not granted. Please allow read access to continue.');
+                return false;
+            }
+            return true;
+        } catch (error) {
+            return false;
+        }
+    },
+    async browseExportFolder(kind) {
+        if (!('showDirectoryPicker' in window)) {
+            const inputId = kind === 'ChatGPT' ? 'chatUploadChatGPT' : 'chatUploadGemini';
+            const input = document.getElementById(inputId);
+            if (input) {
+                input.click();
+                return;
+            }
+            alert('This browser does not support the File System Access API. Please use Chrome, Edge, or another browser that supports showDirectoryPicker(), or upload the export files directly.');
+            return;
+        }
+        const persisted = await this.getStoredDirectoryHandle(kind);
+        if (persisted) {
+            const hasAccess = await this.requestDirectoryPermission(persisted);
+            if (hasAccess) {
+                this.exportHandles[kind] = persisted;
+                await this.processSelectedDirectory(kind, persisted);
+                return;
+            }
+        }
+        try {
+            const handle = await window.showDirectoryPicker({ mode: 'read' });
+            const granted = await this.requestDirectoryPermission(handle);
+            if (!granted) return;
+            await this.persistDirectoryHandle(kind, handle);
+            this.exportHandles[kind] = handle;
+            await this.processSelectedDirectory(kind, handle);
+        } catch (error) {
+            if (error && error.name !== 'AbortError') {
+                console.error(error);
+                alert('Folder access was cancelled or unavailable.');
+            }
+        }
+    },
+    async processSelectedDirectory(kind, folderHandle) {
+        const conversations = await this.collectExportConversations(folderHandle, kind);
+        if (!conversations.length) {
+            document.getElementById('chatStatus').innerText = `⚠️ No ${kind} conversations were found in ${folderHandle.name}.`;
+            return;
+        }
+        const payload = {
+            source_type: kind,
+            folder_name: folderHandle.name,
+            chats: conversations,
+        };
+        document.getElementById('chatStatus').innerText = `⏳ Reading ${conversations.length} ${kind} conversations locally...`;
+        const res = await fetch('/api/import_chat_directory', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.error || 'Unable to import the selected folder.');
+        }
+        document.getElementById('chatStatus').innerText = `✅ Imported ${data.count} ${kind} conversations from ${folderHandle.name}.`;
+        this.listChatFiles();
+        this.pollChats();
+    },
+    async collectExportConversations(folderHandle, kind) {
+        const files = await this.listRelevantExportFiles(folderHandle, kind);
+        const mediaFiles = await this.listMediaFiles(folderHandle);
+        const conversations = [];
+        for (const file of files) {
+            try {
+                const text = await this.readTextFromHandle(file.handle);
+                const parsed = this.parseExportContent(kind, text, file.name);
+                for (const item of parsed) {
+                    const media = mediaFiles.slice(0, 8).map(asset => ({
+                        path: asset.path,
+                        filename: asset.name,
+                        kind: asset.kind,
+                        mimeType: asset.mimeType,
+                    }));
+                    conversations.push({
+                        id: item.id || `${kind}-${file.name}-${Math.random().toString(16).slice(2)}`,
+                        title: item.title || `${kind} Export`,
+                        source: kind,
+                        text: item.text || '',
+                        messages: item.messages || [{ role: 'user', text: item.text || 'Imported chat' }],
+                        summary: item.summary || '',
+                        created_on: item.created_on || null,
+                        closure_reason: item.closure_reason || 'TIMEOUT',
+                        tags: item.tags || {},
+                        media: (item.media && item.media.length ? item.media : media).slice(0, 12),
+                    });
+                }
+            } catch (error) {
+                console.warn(`Unable to parse ${file.name}:`, error);
+            }
+        }
+        return conversations;
+    },
+    async listRelevantExportFiles(folderHandle, kind) {
+        const files = [];
+        const stack = [folderHandle];
+        while (stack.length) {
+            const current = stack.pop();
+            for await (const [name, entry] of current.entries()) {
+                if (entry.kind === 'directory') {
+                    stack.push(entry);
+                    continue;
+                }
+                const lower = name.toLowerCase();
+                const isRelevant = kind === 'ChatGPT'
+                    ? lower.endsWith('.json') && (lower.includes('conversation') || lower.includes('chat') || lower.includes('export') || lower.includes('mapping') || lower.includes('message'))
+                    : lower.endsWith('.html') || lower.endsWith('.json') || lower.endsWith('.txt');
+                if (isRelevant) {
+                    files.push({ name, handle: entry });
+                }
+            }
+        }
+        return files;
+    },
+    async listMediaFiles(folderHandle) {
+        const media = [];
+        const stack = [{ handle: folderHandle, path: '' }];
+        while (stack.length) {
+            const current = stack.pop();
+            for await (const [name, entry] of current.handle.entries()) {
+                const childPath = current.path ? `${current.path}/${name}` : name;
+                if (entry.kind === 'directory') {
+                    stack.push({ handle: entry, path: childPath });
+                    continue;
+                }
+                const lower = name.toLowerCase();
+                if (/\.(png|jpe?g|gif|webp|bmp|mp4|mov|webm|m4v|avi|mp3|wav|aac|dat)$/i.test(lower)) {
+                    media.push({
+                        name,
+                        path: childPath,
+                        kind: /\.(png|jpe?g|gif|webp|bmp)$/i.test(lower) ? 'image' : /\.(mp4|mov|webm|m4v|avi)$/i.test(lower) ? 'video' : /\.(mp3|wav|aac)$/i.test(lower) ? 'audio' : 'file',
+                        mimeType: this.guessMimeType(lower),
+                    });
+                }
+            }
+        }
+        return media;
+    },
+    guessMimeType(fileName) {
+        const lower = String(fileName || '').toLowerCase();
+        if (lower.endsWith('.png')) return 'image/png';
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+        if (lower.endsWith('.gif')) return 'image/gif';
+        if (lower.endsWith('.webp')) return 'image/webp';
+        if (lower.endsWith('.mp4')) return 'video/mp4';
+        if (lower.endsWith('.webm')) return 'video/webm';
+        if (lower.endsWith('.mov')) return 'video/quicktime';
+        if (lower.endsWith('.mp3')) return 'audio/mpeg';
+        if (lower.endsWith('.wav')) return 'audio/wav';
+        if (lower.endsWith('.dat')) return 'application/octet-stream';
+        return 'application/octet-stream';
+    },
+    async readTextFromHandle(fileHandle) {
+        const file = await fileHandle.getFile();
+        return await file.text();
+    },
+    parseExportContent(kind, text, fileName) {
+        if (!text) return [];
+        const trimmed = text.trim();
+        if (!trimmed) return [];
+        try {
+            const json = JSON.parse(trimmed);
+            if (kind === 'ChatGPT') {
+                return this.parseChatgptPayload(json, fileName);
+            }
+            return this.parseGeminiPayload(json, fileName);
+        } catch (error) {
+            if (kind === 'Gemini' && /<html|<body|<div|<p/i.test(trimmed)) {
+                return this.parseGeminiHtml(trimmed, fileName);
+            }
+            const safeText = trimmed.slice(0, 4000);
+            return [{
+                title: fileName.replace(/\.[^/.]+$/, '') || 'Imported Chat',
+                source: kind,
+                text: safeText,
+                messages: [{ role: 'user', text: safeText }],
+                created_on: null,
+                closure_reason: 'TIMEOUT',
+                tags: {},
+            }];
+        }
+    },
+    parseChatgptPayload(data, fileName) {
+        const results = [];
+        const addConversation = (entry) => {
+            if (!entry || !entry.text) return;
+            const messages = Array.isArray(entry.messages) && entry.messages.length ? entry.messages : [{ role: 'user', text: entry.text }];
+            const title = (entry.title || fileName || 'ChatGPT Export').replace(/\.[^/.]+$/, '');
+            results.push({
+                title,
+                source: 'ChatGPT',
+                text: entry.text,
+                summary: entry.summary || '',
+                messages,
+                created_on: entry.created_on || null,
+                closure_reason: entry.closure_reason || 'TIMEOUT',
+                tags: entry.tags || {},
+                media: entry.media || [],
+            });
+        };
+        const walk = (node) => {
+            if (!node || typeof node !== 'object') return;
+            if (node.mapping || node.title || node.messages) {
+                const mapping = node.mapping || {};
+                const messageList = [];
+                const collect = (value) => {
+                    if (!value || typeof value !== 'object') return;
+                    if (Array.isArray(value)) {
+                        value.forEach(item => collect(item));
+                        return;
+                    }
+                    const author = value.author || value.message?.author || value.role || {};
+                    const role = String(author.role || author.type || value.role || 'user');
+                    const content = value.message || value.content || value.text || value.parts || value;
+                    const contentText = this.collectTextFromValue(content);
+                    if (contentText) {
+                        messageList.push({
+                            role: role.toLowerCase().includes('assistant') || role.toLowerCase().includes('model') ? 'assistant' : 'user',
+                            text: contentText,
+                        });
+                    }
+                    Object.values(value).forEach(child => collect(child));
+                };
+                if (typeof mapping === 'object') {
+                    Object.values(mapping).forEach(item => collect(item));
+                }
+                const textParts = messageList.map(item => item.text);
+                const assembled = textParts.join('\n\n');
+                if (assembled) {
+                    addConversation({
+                        title: node.title || 'ChatGPT Export',
+                        text: assembled,
+                        messages: messageList.length ? messageList : [{ role: 'user', text: assembled }],
+                        created_on: node.create_time || node.update_time || null,
+                    });
+                }
+            }
+            Object.values(node).forEach(child => {
+                if (child && typeof child === 'object') walk(child);
+            });
+        };
+        walk(data);
+        if (results.length) return results;
+        const fallbackText = this.collectTextFromValue(data);
+        if (fallbackText) {
+            return [{
+                title: fileName || 'ChatGPT Export',
+                source: 'ChatGPT',
+                text: fallbackText,
+                messages: [{ role: 'user', text: fallbackText }],
+                created_on: null,
+                closure_reason: 'TIMEOUT',
+                tags: {},
+            }];
+        }
+        return [];
+    },
+    parseGeminiPayload(data, fileName) {
+        const results = [];
+        const collectMatches = (node) => {
+            if (!node || typeof node !== 'object') return;
+            if (Array.isArray(node)) {
+                node.forEach(item => collectMatches(item));
+                return;
+            }
+            if (node.messages && Array.isArray(node.messages)) {
+                const messageList = node.messages
+                    .map(msg => {
+                        if (!msg || typeof msg !== 'object') return null;
+                        const role = String(msg.role || msg.author || 'user');
+                        const text = this.collectTextFromValue(msg.text || msg.content || msg.parts || msg.value || msg.response || msg.prompt || '');
+                        if (!text) return null;
+                        return {
+                            role: role.toLowerCase().includes('model') || role.toLowerCase().includes('assistant') ? 'assistant' : 'user',
+                            text,
+                        };
+                    })
+                    .filter(Boolean);
+                if (messageList.length) {
+                    const text = messageList.map(item => item.text).join('\n\n');
+                    results.push({
+                        title: node.title || fileName || 'Gemini Export',
+                        source: 'Gemini',
+                        text,
+                        messages: messageList,
+                        created_on: node.update_time || node.updateTime || node.timestamp || node.create_time || null,
+                        closure_reason: 'TIMEOUT',
+                        tags: {},
+                    });
+                }
+            }
+            Object.values(node).forEach(child => collectMatches(child));
+        };
+        collectMatches(data);
+        if (results.length) return results;
+        const fallbackText = this.collectTextFromValue(data);
+        if (fallbackText) {
+            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text: fallbackText, messages: [{ role: 'user', text: fallbackText }], created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+        }
+        return [];
+    },
+    parseGeminiHtml(html, fileName) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const articleNodes = [...doc.querySelectorAll('article, .message, .chat-message, .conversation, .msg')];
+        const messages = [];
+        articleNodes.forEach(node => {
+            const role = node.className && String(node.className).toLowerCase().includes('model') ? 'assistant' : (node.className && String(node.className).toLowerCase().includes('user') ? 'user' : 'user');
+            const text = this.collectTextFromValue(node.textContent || node.innerText || '');
+            if (text) messages.push({ role, text });
+        });
+        if (!messages.length) {
+            const paragraphs = [...doc.querySelectorAll('p, li, div, span, pre')];
+            paragraphs.forEach(node => {
+                const text = this.collectTextFromValue(node.textContent || node.innerText || '');
+                if (text) messages.push({ role: 'user', text });
+            });
+        }
+        if (!messages.length) {
+            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text: html.slice(0, 4000), messages: [{ role: 'user', text: html.slice(0, 4000) }], created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+        }
+        const text = messages.map(item => item.text).join('\n\n');
+        return [{ title: doc.title || fileName || 'Gemini Export', source: 'Gemini', text, messages, created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+    },
+    collectTextFromValue(value) {
+        if (!value) return '';
+        if (typeof value === 'string') {
+            const cleaned = value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            return cleaned ? cleaned : '';
+        }
+        if (Array.isArray(value)) {
+            const pieces = value.map(item => this.collectTextFromValue(item)).filter(Boolean);
+            return pieces.join('\n\n');
+        }
+        if (typeof value === 'object') {
+            const textKeys = ['text', 'content', 'parts', 'value', 'message', 'response', 'prompt'];
+            const items = [];
+            for (const key of textKeys) {
+                if (value[key]) {
+                    const collected = this.collectTextFromValue(value[key]);
+                    if (collected) items.push(collected);
+                }
+            }
+            if (items.length) return items.join('\n\n');
+            const nested = Object.values(value).map(item => this.collectTextFromValue(item)).filter(Boolean);
+            return nested.join('\n\n');
+        }
+        return String(value).trim();
+    },
+    async uploadChats(sourceType = null) {
+        const inputId = sourceType === 'ChatGPT' ? 'chatUploadChatGPT' : sourceType === 'Gemini' ? 'chatUploadGemini' : 'chatInput';
+        const input = document.getElementById(inputId);
+        if (!input || !input.files.length) return;
+        const formData = new FormData();
+        for (const file of input.files) {
+            formData.append('file', file);
+        }
+        if (sourceType) {
+            formData.append('source_type', sourceType);
+        }
+        formData.append('ollama_url', localStorage.getItem('ollamaUrl') || 'http://localhost:11434');
+        formData.append('ollama_model', localStorage.getItem('ollamaModel') || 'llama3.1');
+        document.getElementById('chatStatus').innerText = "⏳ Parsing...";
+        const res = await fetch('/api/upload_chats', { method: 'POST', body: formData });
+        const data = await res.json();
+        document.getElementById('chatStatus').innerText = `✅ Processed ${data.count} chats.`;
+        input.value = '';
+        this.listChatFiles();
+        this.pollChats();
+    },
+    async loadChatMedia(chat) {
+        const mediaList = Array.isArray(chat.media) ? chat.media : [];
+        if (!mediaList.length) return [];
+        const source = chat.source || 'ChatGPT';
+        const folderHandle = this.exportHandles[source];
+        if (!folderHandle) return [];
+        const resolved = [];
+        for (const asset of mediaList) {
+            try {
+                const pathParts = String(asset.path || asset.filename || '').split(/[\\/]/).filter(Boolean);
+                if (!pathParts.length) continue;
+                let handle = folderHandle;
+                for (let i = 0; i < pathParts.length - 1; i += 1) {
+                    handle = await handle.getDirectoryHandle(pathParts[i]);
+                }
+                const fileHandle = await handle.getFileHandle(pathParts[pathParts.length - 1]);
+                const file = await fileHandle.getFile();
+                resolved.push({ ...asset, url: URL.createObjectURL(file) });
+            } catch (error) {
+                console.warn('Unable to read media file from export folder:', error);
+            }
+        }
+        return resolved;
+    },
+    closeChatReader() {
+        document.getElementById('chatReaderModal').style.display = 'none';
+        const media = document.querySelectorAll('#readerMedia img, #readerMedia video, #readerMedia audio');
+        media.forEach(node => {
+            if (node.src && node.src.startsWith('blob:')) {
+                URL.revokeObjectURL(node.src);
+            }
+        });
+        document.getElementById('readerMedia').innerHTML = '';
+    },
+    renderChatReader(chat, mediaUrls) {
+        const title = document.getElementById('readerTitle');
+        const meta = document.getElementById('readerMeta');
+        const summary = document.getElementById('readerSummary');
+        const tags = document.getElementById('readerTags');
+        const text = document.getElementById('readerText');
+        const media = document.getElementById('readerMedia');
+
+        title.textContent = chat.title || 'Conversation';
+        meta.textContent = `${chat.source || ''} · ${chat.created_on || 'undated'} · ${chat.closure_reason || ''}`;
+        summary.textContent = chat.summary || '';
+        tags.innerHTML = (chat.visible_tags || []).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
+
+        const messageList = Array.isArray(chat.messages) && chat.messages.length ? chat.messages : [{ role: 'user', text: chat.text || '' }];
+        text.innerHTML = messageList.map(msg => {
+            const role = String(msg.role || 'user').toLowerCase();
+            const label = role.includes('assistant') || role.includes('model') ? 'AI' : 'User';
+            const body = this.escape(String(msg.text || '')).replace(/\n/g, '<br>');
+            return `<div class="message-row ${role.includes('assistant') || role.includes('model') ? 'assistant' : 'user'}">
+                <div class="message-label">${label}</div>
+                <div class="message-bubble ${role.includes('assistant') || role.includes('model') ? 'assistant' : 'user'}">
+                    <div class="message-text">${body}</div>
+                </div>
+            </div>`;
+        }).join('');
+
+        media.innerHTML = (mediaUrls || []).map(asset => {
+            if (asset.kind === 'image') {
+                return `<div class="media-item"><img src="${asset.url}" alt="${this.escape(asset.filename || 'image')}"><div class="media-caption">${this.escape(asset.filename || 'Image')}</div></div>`;
+            }
+            if (asset.kind === 'video') {
+                return `<div class="media-item"><video controls src="${asset.url}"></video><div class="media-caption">${this.escape(asset.filename || 'Video')}</div></div>`;
+            }
+            if (asset.kind === 'audio') {
+                return `<div class="media-item"><audio controls src="${asset.url}"></audio><div class="media-caption">${this.escape(asset.filename || 'Audio')}</div></div>`;
+            }
+            return `<div class="media-item"><a href="${asset.url}" target="_blank" rel="noopener noreferrer">${this.escape(asset.filename || 'Attachment')}</a></div>`;
+        }).join('');
+    },
+    async openChat(id) {
+        const res = await fetch(`/api/chats/${encodeURIComponent(id)}`);
+        const data = await res.json();
+        const mediaUrls = await this.loadChatMedia(data);
+        this.renderChatReader(data, mediaUrls);
+        document.getElementById('chatReaderModal').style.display = 'flex';
+    },
+    async retagChats() {
+        document.getElementById('chatStatus').innerText = 'Recalculating tags...';
+        await fetch('/api/chats/retag', { method: 'POST' });
+        this.pollChats();
     },
     async loadTags() {
         const list = document.getElementById('tagListEditor');
@@ -269,11 +802,17 @@ const app = {
         }
         document.getElementById('repoStatus').innerText = data.error || '';
     },
-    async uploadChats() {
-        const input = document.getElementById('chatInput');
-        if(!input.files.length) return;
+    async uploadChats(sourceType = null) {
+        const inputId = sourceType === 'ChatGPT' ? 'chatUploadChatGPT' : sourceType === 'Gemini' ? 'chatUploadGemini' : 'chatInput';
+        const input = document.getElementById(inputId);
+        if (!input || !input.files.length) return;
         const formData = new FormData();
-        for(let f of input.files) formData.append('file', f);
+        for (const file of input.files) {
+            formData.append('file', file);
+        }
+        if (sourceType) {
+            formData.append('source_type', sourceType);
+        }
         formData.append('ollama_url', localStorage.getItem('ollamaUrl') || 'http://localhost:11434');
         formData.append('ollama_model', localStorage.getItem('ollamaModel') || 'llama3.1');
         document.getElementById('chatStatus').innerText = "⏳ Parsing...";

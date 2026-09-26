@@ -86,10 +86,17 @@
                     <div>
                         <div class="eyebrow">Knowledge intake</div>
                         <h1>AI Chat Corpus</h1>
-                        <p class="subtitle">Import ChatGPT JSON or Gemini HTML/text exports to map closure intents.</p>
+                        <p class="subtitle">Browse the unzipped ChatGPT or Gemini export folder directly in the browser.</p>
+                    </div>
+                    <div class="chat-tools">
+                        <button class="btn primary" onclick="app.browseExportFolder('ChatGPT')">📂 Browse ChatGPT Folder</button>
+                        <button class="btn outline small" title="Upload ChatGPT export files directly to the server (fallback for Docker/remote use)." onclick="document.getElementById('chatUploadChatGPT').click()">↑ Upload ChatGPT</button>
+                        <button class="btn outline" onclick="app.browseExportFolder('Gemini')">📂 Browse Gemini Folder</button>
+                        <button class="btn outline small" title="Upload Gemini export files directly to the server (fallback for Docker/remote use)." onclick="document.getElementById('chatUploadGemini').click()">↑ Upload Gemini</button>
                     </div>
                     <input type="file" id="chatInput" multiple accept="*/*" style="display:none;" onchange="app.uploadChats()">
-                    <button class="btn primary" onclick="document.getElementById('chatInput').click()">📂 Upload Any Chats</button>
+                    <input type="file" id="chatUploadChatGPT" multiple accept=".json,application/json" style="display:none;" onchange="app.uploadChats('ChatGPT')">
+                    <input type="file" id="chatUploadGemini" multiple accept=".html,.json,.txt,text/html,application/json" style="display:none;" onchange="app.uploadChats('Gemini')">
                 </div>
                 <div id="chatProgress" class="progress-block" hidden>
                     <div class="progress-meta"><span id="chatProgressLabel">0%</span></div>
@@ -266,13 +273,19 @@
 
     <div class="modal-backdrop" id="chatReaderModal" style="display:none;">
         <div class="modal reader-modal">
-            <h2 id="readerTitle">Conversation</h2>
-            <div id="readerMeta" class="muted"></div>
+            <div class="reader-header">
+                <div>
+                    <h2 id="readerTitle">Conversation</h2>
+                    <div id="readerMeta" class="muted"></div>
+                </div>
+                <button class="btn outline" onclick="app.closeChatReader()">Close</button>
+            </div>
             <p id="readerSummary"></p>
             <div id="readerTags" class="chip-row"></div>
-            <pre id="readerText" class="reader-text"></pre>
+            <div id="readerMedia" class="media-gallery"></div>
+            <div id="readerText" class="reader-text"></div>
             <div class="modal-actions">
-                <button class="btn outline" onclick="document.getElementById('chatReaderModal').style.display='none'">Close</button>
+                <button class="btn outline" onclick="app.closeChatReader()">Close</button>
             </div>
         </div>
     </div>

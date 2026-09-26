@@ -102,6 +102,35 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(conversations[0]["source"], "Gemini")
         self.assertIn("deployment timeout", conversations[0]["text"].lower())
 
+    def test_imports_browser_folder_payload_without_file_upload(self):
+        with app.test_client() as client:
+            response = client.post(
+                "/api/import_chat_directory",
+                json={
+                    "source_type": "ChatGPT",
+                    "folder_name": "my-export",
+                    "chats": [{
+                        "title": "Browser Import",
+                        "source": "ChatGPT",
+                        "text": "Need a fix for auth. Use the middleware.",
+                        "messages": [
+                            {"role": "user", "text": "Need a fix for auth."},
+                            {"role": "assistant", "text": "Use the middleware."},
+                        ],
+                        "created_on": "2024-06-01",
+                        "closure_reason": "SOLVED",
+                        "tags": {"backend": 0.9},
+                        "media": [{"path": "assets/clip.mp4", "filename": "clip.mp4", "kind": "video"}],
+                    }],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(state.conversations[-1]["source_file"], "my-export")
+        self.assertEqual(state.conversations[-1]["source"], "ChatGPT")
+
     @patch("app.requests.get")
     def test_lists_available_ollama_models(self, mock_get):
         mock_get.return_value.status_code = 200

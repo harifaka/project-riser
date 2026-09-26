@@ -1654,9 +1654,67 @@ def delete_chat_file(filename):
     return jsonify({'status': 'success', 'removed': safe_name})
 
 
+@app.route('/api/import_chat_directory', methods=['POST'])
+def import_chat_directory():
+    payload = request.get_json(silent=True) or {}
+    source_name = str(payload.get('source_type') or 'ChatGPT').strip() or 'ChatGPT'
+    folder_name = str(payload.get('folder_name') or source_name).strip() or source_name
+    imported = []
+    for raw_chat in payload.get('chats') or []:
+        if not isinstance(raw_chat, dict):
+            continue
+        messages = raw_chat.get('messages') or []
+        if not isinstance(messages, list):
+            messages = []
+        normalized_messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get('role') or 'user').strip().lower() or 'user'
+            text = str(message.get('text') or '').strip()
+            if text:
+                normalized_messages.append({'role': 'assistant' if role.startswith('assistant') or role.startswith('model') else 'user', 'text': text})
+        text = str(raw_chat.get('text') or '').strip()
+        if not text and normalized_messages:
+            text = '\n\n'.join(item.get('text', '') for item in normalized_messages if item.get('text'))
+        if not text:
+            text = str(raw_chat.get('summary') or 'Imported chat').strip()
+        title = str(raw_chat.get('title') or 'Imported Chat').strip() or 'Imported Chat'
+        summary = str(raw_chat.get('summary') or '').strip() or LLMService.clamp_description(text, state.settings.get('description_word_budget', 18))
+        closure = str(raw_chat.get('closure_reason') or 'TIMEOUT').strip().upper()
+        if closure not in {'SOLVED', 'CONTEXT_LOST', 'TIMEOUT'}:
+            closure = 'TIMEOUT'
+        tags = raw_chat.get('tags') or {}
+        if not isinstance(tags, dict):
+            tags = {}
+        record = {
+            'id': str(raw_chat.get('id') or uuid.uuid4()),
+            'title': title,
+            'source': str(raw_chat.get('source') or source_name),
+            'text': text,
+            'messages': normalized_messages or [{'role': 'user', 'text': text}],
+            'summary': summary,
+            'closure_reason': closure,
+            'created_on': raw_chat.get('created_on'),
+            'tags': tags,
+            'media': raw_chat.get('media') or [],
+            'source_file': folder_name,
+        }
+        if not record['tags']:
+            record['tags'] = LayaDecisionService().score(text)
+        imported.append(record)
+    if imported:
+        state.conversations.extend(imported)
+        ChatLinker.rebind_loaded_chats()
+    state.chat_files = [f for f in state.chat_files if f.get('name') != folder_name]
+    state.chat_files.append({'name': folder_name, 'type': source_name, 'size': 0, 'uploaded_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')})
+    return jsonify({'status': 'success', 'count': len(imported), 'files': state.chat_files})
+
+
 @app.route('/api/upload_chats', methods=['POST'])
 def upload_chats():
     url, model = request.form.get('ollama_url'), request.form.get('ollama_model')
+    forced_source = str(request.form.get('source_type') or '').strip() or None
     uploaded_count = 0
     for file in request.files.getlist('file'):
         if not file or not file.filename:
@@ -1666,11 +1724,15 @@ def upload_chats():
         parsed = ChatAnalyzer.parse_and_analyze(file_content.decode('utf-8', errors='ignore'), url, model)
         for chat in parsed:
             chat['source_file'] = safe_name
+            if forced_source and chat.get('source') in (None, '', 'Unknown'):
+                chat['source'] = forced_source
+            elif forced_source and chat.get('source'):
+                chat['source'] = forced_source if str(chat.get('source')).lower() in ('chatgpt', 'gemini') else chat.get('source')
         state.conversations.extend(parsed)
         ChatLinker.rebind_loaded_chats()
         uploaded_count += len(parsed)
         state.chat_files = [f for f in state.chat_files if f['name'] != safe_name]
-        state.chat_files.append({'name': safe_name, 'size': len(file_content), 'uploaded_at': datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')})
+        state.chat_files.append({'name': safe_name, 'source_type': forced_source or (parsed[0].get('source') if parsed else 'Unknown'), 'size': len(file_content), 'uploaded_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')})
     return jsonify({'status': 'success', 'count': uploaded_count, 'files': state.chat_files})
 
 
@@ -1891,6 +1953,8 @@ def chat_detail(chat_id):
     if chat is None:
         return jsonify({'error': 'Chat not found.'}), 404
     visible = [tag.get('name') for tag in state.tags if chat_matches_tag(chat, tag)]
+    messages = chat.get('messages') or [{'role': 'user', 'text': chat.get('text') or ''}]
+    media = chat.get('media') or []
     return jsonify({
         'id': chat.get('id'),
         'title': chat.get('title'),
@@ -1899,6 +1963,8 @@ def chat_detail(chat_id):
         'summary': chat.get('summary'),
         'closure_reason': chat.get('closure_reason'),
         'text': chat.get('text'),
+        'messages': messages,
+        'media': media,
         'tags': chat.get('tags') or {},
         'visible_tags': visible,
         'manual_tags': list(state.tag_assignments.get('chats', {}).get(str(chat_id), []) or []),
