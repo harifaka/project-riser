@@ -579,13 +579,23 @@ class LLMService:
 
     @staticmethod
     def ask(prompt, url, model):
-        if not url or not model:
+        if not model:
             fallback = LLMService.fallback_for_prompt(prompt)
             print(f'[llm-fallback] missing model config: {fallback}')
             return fallback
+        resolved_url = LLMService.resolve_ollama_url(url or state.settings.get('ollama_url'))
+        if not resolved_url:
+            fallback = LLMService.fallback_for_prompt(prompt)
+            print(f'[llm-fallback] missing ollama config: {fallback}')
+            return fallback
+        if url and str(url).strip() and resolved_url != str(url).strip().rstrip('/'):
+            try:
+                state.settings['ollama_url'] = resolved_url
+            except Exception:
+                pass
         try:
             response = requests.post(
-                f'{url}/api/generate',
+                f'{resolved_url}/api/generate',
                 json={'model': model, 'prompt': prompt, 'stream': False},
                 timeout=45,
             )

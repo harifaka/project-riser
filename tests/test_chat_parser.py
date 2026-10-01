@@ -206,6 +206,22 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(LLMService.ask("Estimate resurrection effort (S, M, L, XL)...", "http://localhost:11434", "llama3.1"), "M")
         self.assertEqual(LLMService.ask("Write a 1-sentence summary of this code:", "http://localhost:11434", "llama3.1"), "No code extracted.")
 
+    @patch("app.requests.get")
+    @patch("app.requests.post")
+    @patch("app.os.path.exists", return_value=True)
+    def test_llm_ask_resolves_docker_ollama_url(self, mock_exists, mock_post, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"response": "backend"}
+
+        LLMService.ask("tag this", "http://localhost:11434", "llama3.1")
+
+        mock_post.assert_called_once_with(
+            "http://host.docker.internal:11434/api/generate",
+            json={"model": "llama3.1", "prompt": "tag this", "stream": False},
+            timeout=45,
+        )
+
     @patch("app.executor.submit", side_effect=_idle_submit)
     @patch("app.Github")
     def test_scan_github_seeds_repo_cards_immediately(self, mock_github, _submit):

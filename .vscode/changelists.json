@@ -3,10 +3,11 @@
     {
       "name": "Default",
       "files": [
+        "tests/test_chat_parser.py",
         ".vscode/changelists.json",
-        "static/css/style.css",
-        "templates/index.html",
-        "static/js/app.js"
+        "app.py",
+        "docker-compose.yml",
+        "ROADMAP.md"
       ]
     }
   ],

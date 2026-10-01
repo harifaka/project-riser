@@ -92,20 +92,20 @@ These settings are saved in the compact tag/settings JSON cache so they survive 
 
 The project currently ships the following core behavior:
 - GitHub repo scan that seeds every card, then analyzes changed repos in parallel
-- hash and tag-fingerprint cache with batched scan snapshots
-- percent progress, scan log, and in-place card updates
+- Hash and tag-fingerprint cache with batched scan snapshots
+- Percent progress, scan log, and in-place card updates
 - Laya tagging for repos and conversations, with a calibration modal
-- tag editor and bulk assign or unassign
-- chat reader with heatmap, summary, and per-tag counts
-- conversation retag independent of GitHub sync
-- behavior-based conversation linking, with pin and unlink, feeding Time Travel
+- Tag editor and bulk assign or unassign
+- **[NEEDS FIX]** Chat reader with heatmap, summary, and per-tag counts
+- Conversation retag independent of GitHub sync
+- **[NEEDS FIX]** Behavior-based conversation linking, feeding Time Travel
 
-## Open items
+## 10. Open Items & Immediate Action Plan (For Cursor)
 
-- Chat modal for editing topic splits and complexity by hand.
-- More framework-specific extraction and route heuristics.
-- CSV and welcome-back export panels, and a separate AI Linker view. Conversation linking already runs from the repository header and each repo card.
-- Settings controls for chunk size and description word budget. The server already stores both.
+**High Priority: Debugging & Fixing Existing Logic**
+- **Fix Chat Viewer:** The current chat viewer and RAM-based reading logic is unstable/buggy. Debug the parsing of ChatGPT/Gemini JSONs so it correctly displays conversations, summaries, and match counts on the UI.
+- **Fix AI Linker (Repo-Chat Matching):** The mechanism matching loaded conversations to repositories is failing or inaccurate. Fix the Laya confidence threshold filtering and Ollama prompt pipeline so chats are reliably linked, pinned, and displayed on repo cards.
 
-
-
+**Core Logic Enhancements**
+- **Strict Chat Summarization (System 2):** Update the Ollama prompt for chat imports to strictly enforce an Extractive-Abstractive format: exactly a 4-word title, a 1-sentence summary, and language detection.
+- **Mental Debt / Emotional Comment Hunter:** Expand the RAM-based ZIP code extraction to actively hunt for emotional/frustrated developer comments (e.g., `// FIXME`, `// TODO`, `// I hate this part`, `// hack`). Feed this data directly into the Mood X-Ray calculation.
