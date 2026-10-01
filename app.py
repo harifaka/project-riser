@@ -9,6 +9,7 @@ import re
 import io
 import zipfile
 import html
+from html.parser import HTMLParser
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -406,7 +407,7 @@ def chat_overview_payload():
             sources[source] = sources.get(source, 0) + 1
             closure = chat.get('closure_reason') or 'TIMEOUT'
             closures[closure] = closures.get(closure, 0) + 1
-            day = chat.get('created_on')
+            day = ChatAnalyzer._coerce_day(chat.get('created_on'))
             if day:
                 dated += 1
                 day_counts[day] = day_counts.get(day, 0) + 1
@@ -416,6 +417,7 @@ def chat_overview_payload():
                 'title': chat.get('title'),
                 'source': source,
                 'created_on': day,
+                'language': chat.get('language') or ChatAnalyzer._detect_language(chat.get('text') or ''),
                 'summary': chat.get('summary'),
                 'closure_reason': closure,
                 'tags': visible,
@@ -730,7 +732,17 @@ class ChatAnalyzer:
         if len(meaningful) < 4:
             fallback = (text or '').split()
             meaningful = [w for w in fallback if w.strip()]
-        return ' '.join(meaningful[:4]).strip()[:80] or 'Imported Chat'
+        words = meaningful[:4]
+        defaults = ['Imported', 'Chat', 'Summary', 'Conversation']
+        words.extend(defaults[len(words):])
+        return ' '.join(words)[:80]
+
+    @staticmethod
+    def _strict_title(title, text):
+        candidate = re.sub(r'\s+', ' ', str(title or '').strip())
+        if len(candidate.split()) == 4:
+            return candidate[:80]
+        return ChatAnalyzer._fallback_title(text)
 
     @staticmethod
     def _normalize_summary(summary):
@@ -792,12 +804,20 @@ class ChatAnalyzer:
         title = str(payload.get('title') or '').strip()
         summary = str(payload.get('summary') or '').strip()
         language = str(payload.get('language') or '').strip() or ChatAnalyzer._detect_language(text)
-        if len(title.split()) != 4:
-            title = ChatAnalyzer._fallback_title(text)
-        if len(title.split()) != 4:
-            title = ' '.join(title.split()[:4]) if title.split() else 'Imported Chat'
+        title = ChatAnalyzer._strict_title(title, text)
         summary = ChatAnalyzer._normalize_summary(summary or text)
         return {'title': title, 'summary': summary, 'language': language or 'en'}
+
+    @staticmethod
+    def _classify_closure(text, url, model):
+        last_messages = (text or '')[-3000:]
+        prompt = (
+            'Analyze the end of this dev chat. Did the user get a solution (SOLVED), '
+            'did the AI fail giving bad context (CONTEXT_LOST), or did it just end abruptly (TIMEOUT)? '
+            'Reply with ONE exact word.\nChat end: ' + last_messages[-1000:]
+        )
+        closure = LLMService.ask(prompt, url, model)
+        return closure if closure in {'SOLVED', 'CONTEXT_LOST', 'TIMEOUT'} else 'TIMEOUT'
 
     @staticmethod
     def _clean_text(value):
@@ -812,21 +832,36 @@ class ChatAnalyzer:
     def _extract_html_text(raw_html):
         if not raw_html:
             return []
-        text = re.sub(r'(?is)<script.*?</script>', ' ', raw_html)
-        text = re.sub(r'(?is)<style.*?</style>', ' ', text)
-        blocks = []
-        for pattern in [
-            r'(?is)<(?:p|li|div|article|span|pre|h[1-6]|td|tr)\b[^>]*>(.*?)</(?:p|li|div|article|span|pre|h[1-6]|td|tr)>',
-            r'(?is)<title\b[^>]*>(.*?)</title>',
-            r'(?is)\b(?:prompt|response|user|assistant|message|content)\b[^<]*<.*?>(.*?)</.*?>'
-        ]:
-            for match in re.finditer(pattern, text):
-                cleaned = ChatAnalyzer._clean_text(match.group(1))
-                if cleaned:
-                    blocks.append(cleaned)
-        if not blocks:
-            blocks = [ChatAnalyzer._clean_text(re.sub(r'<[^>]+>', ' ', text, flags=re.DOTALL))]
-        return [b for b in blocks if b]
+
+        class TextExtractor(HTMLParser):
+            BLOCK_TAGS = {'article', 'br', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'p', 'pre', 'td', 'tr'}
+            SKIP_TAGS = {'script', 'style', 'title'}
+
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.parts = []
+                self.skip_depth = 0
+
+            def handle_starttag(self, tag, attrs):
+                if tag in self.SKIP_TAGS:
+                    self.skip_depth += 1
+                elif not self.skip_depth and tag in self.BLOCK_TAGS:
+                    self.parts.append('\n')
+
+            def handle_endtag(self, tag):
+                if tag in self.SKIP_TAGS and self.skip_depth:
+                    self.skip_depth -= 1
+                elif not self.skip_depth and tag in self.BLOCK_TAGS:
+                    self.parts.append('\n')
+
+            def handle_data(self, data):
+                if not self.skip_depth:
+                    self.parts.append(data)
+
+        extractor = TextExtractor()
+        extractor.feed(raw_html)
+        text = ''.join(extractor.parts)
+        return [re.sub(r'\s+', ' ', block).strip() for block in re.split(r'\n+', text) if block.strip()]
 
     @staticmethod
     def _extract_from_mapping(mapping):
@@ -886,30 +921,61 @@ class ChatAnalyzer:
                 found.extend(ChatAnalyzer._extract_from_json(item))
         elif isinstance(data, dict):
             if 'mapping' in data:
+                messages = []
+                mapping = data.get('mapping')
+                if isinstance(mapping, dict):
+                    for node in mapping.values():
+                        if not isinstance(node, dict):
+                            continue
+                        message = node.get('message') or node
+                        if not isinstance(message, dict):
+                            continue
+                        content = message.get('content') or message.get('text') or message.get('parts') or ''
+                        message_text = ' '.join(ChatAnalyzer._extract_from_mapping({'content': content}))
+                        if not message_text:
+                            continue
+                        author = message.get('author') or node.get('author') or {}
+                        role = author.get('role', '') if isinstance(author, dict) else str(author)
+                        role = str(role or message.get('role') or 'user').lower()
+                        messages.append({
+                            'role': 'assistant' if 'assistant' in role or 'model' in role else 'user',
+                            'text': message_text,
+                        })
+                text_parts = [message['text'] for message in messages] or ChatAnalyzer._extract_from_mapping(mapping)
                 found.append({
                     'title': data.get('title', 'Imported Chat'),
                     'source': 'ChatGPT',
-                    'text_parts': ChatAnalyzer._extract_from_mapping(data.get('mapping')),
+                    'text_parts': text_parts,
+                    'messages': messages,
                     'created_on': ChatAnalyzer._coerce_day(data.get('create_time') or data.get('update_time')),
                 })
             elif 'messages' in data:
                 text_parts = []
+                messages = []
                 for msg in data.get('messages', []):
                     if isinstance(msg, dict):
-                        if 'text' in msg and isinstance(msg['text'], str):
-                            text_parts.append(msg['text'])
-                        for key in ('content', 'parts', 'value'):
-                            if key in msg:
-                                value = msg[key]
-                                if isinstance(value, str):
-                                    text_parts.append(value)
-                                elif isinstance(value, list):
-                                    text_parts.extend([str(v) for v in value if isinstance(v, str)])
+                        message_parts = ChatAnalyzer._extract_from_mapping({'message': msg})
+                        for key in ('text', 'content', 'parts', 'value', 'response', 'prompt'):
+                            value = msg.get(key)
+                            if isinstance(value, str) and value.strip() and value not in message_parts:
+                                message_parts.append(value)
+                        message_parts = list(dict.fromkeys(part for part in message_parts if part.strip()))
+                        if not message_parts:
+                            continue
+                        text_parts.extend(message_parts)
+                        author = msg.get('author') or {}
+                        role = author.get('role', '') if isinstance(author, dict) else str(author)
+                        role = str(role or msg.get('role') or 'user').lower()
+                        messages.append({
+                            'role': 'assistant' if 'assistant' in role or 'model' in role else 'user',
+                            'text': ' '.join(message_parts),
+                        })
                 if text_parts:
                     found.append({
                         'title': data.get('title', 'Imported Chat'),
                         'source': 'Gemini',
                         'text_parts': text_parts,
+                        'messages': messages,
                         'created_on': ChatAnalyzer._coerce_day(data.get('update_time') or data.get('updateTime') or data.get('timestamp') or data.get('create_time')),
                     })
             else:
@@ -956,11 +1022,7 @@ class ChatAnalyzer:
                 continue
             source = conv.get('source', 'Gemini')
             full_text = ' '.join(text_parts)
-            last_messages = ' '.join(text_parts[-3:])
-            prompt = f"Analyze the end of this dev chat. Did the user get a solution (SOLVED), did the AI fail giving bad context (CONTEXT_LOST), or did it just end abruptly (TIMEOUT)? Reply with ONE exact word.\nChat end: {last_messages[-1000:]}"
-            closure = LLMService.ask(prompt, url, model)
-            if closure not in ['SOLVED', 'CONTEXT_LOST', 'TIMEOUT']:
-                closure = 'TIMEOUT'
+            closure = ChatAnalyzer._classify_closure(full_text, url, model)
             summary_payload = ChatAnalyzer._build_strict_summary(full_text, url, model)
             if summary_payload:
                 title = summary_payload['title']
@@ -973,13 +1035,14 @@ class ChatAnalyzer:
             tags = LayaDecisionService().score(full_text)
             extracted.append({
                 'id': str(uuid.uuid4()),
-                'title': title,
+                'title': ChatAnalyzer._strict_title(title, full_text),
                 'source': source,
-                'text': full_text[:3000],
+                'text': full_text,
                 'summary': summary,
                 'language': language,
                 'closure_reason': closure,
                 'created_on': conv.get('created_on'),
+                'messages': conv.get('messages') or [{'role': 'user', 'text': full_text}],
                 'tags': tags,
             })
         return extracted
@@ -1414,7 +1477,7 @@ class ChatLinker:
         reason = re.sub(r'\s+', ' ', str(payload.get('reason') or '')).strip()
         if not reason:
             reason = 'This conversation describes the same unfinished project behavior.'
-        return {'match': round(min(1.0, max(0.0, score)), 3), 'reason': reason}
+        return {'match': round(min(1.0, max(0.0, score)), 3), 'reason': ChatAnalyzer._normalize_summary(reason)}
 
     def propose_links(self, repo, chats, confirmer=None):
         rejected = set(repo.get('rejected_chat_fingerprints') or [])
@@ -1498,7 +1561,7 @@ class ChatLinker:
                 link['chat_id'] = matched.get('id')
                 link['title'] = matched.get('title') or link.get('title')
                 return matched
-        return by_id
+        return by_id if not fingerprint else None
 
     @staticmethod
     def public_links(repo):
@@ -1796,11 +1859,29 @@ def import_chat_directory():
             text = '\n\n'.join(item.get('text', '') for item in normalized_messages if item.get('text'))
         if not text:
             text = str(raw_chat.get('summary') or 'Imported chat').strip()
-        title = str(raw_chat.get('title') or 'Imported Chat').strip() or 'Imported Chat'
-        summary = str(raw_chat.get('summary') or '').strip() or LLMService.clamp_description(text, state.settings.get('description_word_budget', 18))
-        closure = str(raw_chat.get('closure_reason') or 'TIMEOUT').strip().upper()
+        raw_title = str(raw_chat.get('title') or '').strip()
+        raw_summary = str(raw_chat.get('summary') or '').strip()
+        raw_language = str(raw_chat.get('language') or '').strip()
+        summary_payload = None
+        if len(raw_title.split()) != 4 or not raw_summary or not raw_language:
+            summary_payload = ChatAnalyzer._build_strict_summary(
+                text,
+                state.settings.get('ollama_url'),
+                state.settings.get('ollama_model'),
+            )
+        title = ChatAnalyzer._strict_title(raw_title or (summary_payload or {}).get('title'), text)
+        summary = ChatAnalyzer._normalize_summary(
+            raw_summary or (summary_payload or {}).get('summary')
+            or LLMService.clamp_description(text, state.settings.get('description_word_budget', 18))
+        )
+        language = raw_language or (summary_payload or {}).get('language') or ChatAnalyzer._detect_language(text)
+        closure = str(raw_chat.get('closure_reason') or '').strip().upper()
         if closure not in {'SOLVED', 'CONTEXT_LOST', 'TIMEOUT'}:
-            closure = 'TIMEOUT'
+            closure = ChatAnalyzer._classify_closure(
+                text,
+                state.settings.get('ollama_url'),
+                state.settings.get('ollama_model'),
+            )
         tags = raw_chat.get('tags') or {}
         if not isinstance(tags, dict):
             tags = {}
@@ -1811,8 +1892,9 @@ def import_chat_directory():
             'text': text,
             'messages': normalized_messages or [{'role': 'user', 'text': text}],
             'summary': summary,
+            'language': language,
             'closure_reason': closure,
-            'created_on': raw_chat.get('created_on'),
+            'created_on': ChatAnalyzer._coerce_day(raw_chat.get('created_on')),
             'tags': tags,
             'media': raw_chat.get('media') or [],
             'source_file': folder_name,
@@ -2077,6 +2159,7 @@ def chat_detail(chat_id):
         'title': chat.get('title'),
         'source': chat.get('source'),
         'created_on': chat.get('created_on'),
+        'language': chat.get('language') or ChatAnalyzer._detect_language(chat.get('text') or ''),
         'summary': chat.get('summary'),
         'closure_reason': chat.get('closure_reason'),
         'text': chat.get('text'),

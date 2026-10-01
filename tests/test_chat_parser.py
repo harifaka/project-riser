@@ -52,6 +52,7 @@ class ChatAnalyzerTests(unittest.TestCase):
                 "mapping": {
                     "a": {
                         "message": {
+                                "author": {"role": "user"},
                             "content": {
                                 "parts": [
                                     "I need to fix the auth bug.",
@@ -62,6 +63,7 @@ class ChatAnalyzerTests(unittest.TestCase):
                     },
                     "b": {
                         "message": {
+                                "author": {"role": "assistant"},
                             "content": {
                                 "parts": [
                                     "Use the existing session middleware and add validation."
@@ -79,6 +81,7 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(conversations[0]["source"], "ChatGPT")
         self.assertIn("auth bug", conversations[0]["text"].lower())
         self.assertEqual(conversations[0]["created_on"], "2023-11-14")
+        self.assertEqual([message["role"] for message in conversations[0]["messages"]], ["user", "assistant"])
 
     def test_parses_gemini_html_export(self):
         html = """
@@ -105,7 +108,59 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(conversations[0]["source"], "Gemini")
         self.assertIn("deployment timeout", conversations[0]["text"].lower())
 
-    def test_imports_browser_folder_payload_without_file_upload(self):
+    @patch("app.LLMService.ask", side_effect=[
+        "SOLVED",
+        '{"title":"Gemini Nested Message Plan","summary":"The deployment timeout was fixed.","language":"en"}',
+    ])
+    def test_parses_gemini_json_with_nested_message_parts(self, _mock_ask):
+        payload = {
+            "title": "Deployment timeout",
+            "messages": [
+                {"author": "user", "content": {"parts": ["The deployment timeout is too short."]}},
+                {"author": "model", "content": {"parts": ["Increase the health check timeout."]}},
+            ],
+        }
+
+        conversations = ChatAnalyzer.parse_and_analyze(__import__('json').dumps(payload), "http://localhost:11434", "llama3.1")
+
+        self.assertEqual(len(conversations), 1)
+        self.assertEqual(conversations[0]["source"], "Gemini")
+        self.assertIn("deployment timeout is too short", conversations[0]["text"].lower())
+        self.assertIn("increase the health check timeout", conversations[0]["text"].lower())
+        self.assertEqual([message["role"] for message in conversations[0]["messages"]], ["user", "assistant"])
+
+    @patch("app.LLMService.ask", side_effect=[
+        "SOLVED",
+        '{"title":"Long Export Body Read","summary":"The complete export body is retained.","language":"en"}',
+    ])
+    def test_chatgpt_json_parser_keeps_full_body_and_turns(self, _mock_ask):
+        user_text = "user detail " * 1500
+        assistant_text = "assistant detail " * 500
+        payload = [{
+            "title": "Long export",
+            "create_time": 1700000000,
+            "mapping": {
+                "user": {"message": {"author": {"role": "user"}, "content": {"parts": [user_text]}}},
+                "assistant": {"message": {"author": {"role": "assistant"}, "content": {"parts": [assistant_text]}}},
+            },
+        }]
+
+        conversations = ChatAnalyzer.parse_and_analyze(__import__('json').dumps(payload), "http://localhost:11434", "llama3.1")
+
+        self.assertEqual(conversations[0]["text"], f"{user_text} {assistant_text}")
+        self.assertGreater(len(conversations[0]["text"]), 3000)
+        self.assertEqual([message["role"] for message in conversations[0]["messages"]], ["user", "assistant"])
+
+    def test_gemini_html_extraction_does_not_repeat_nested_content(self):
+        extracted = ChatAnalyzer._extract_html_text(
+            '<article><h2>Prompt</h2><p>Fix the deployment timeout.</p><p>Check health probes.</p></article>'
+        )
+
+        self.assertEqual(extracted.count("Fix the deployment timeout."), 1)
+        self.assertEqual(extracted.count("Check health probes."), 1)
+
+    @patch("app.LLMService.ask", return_value='{"title":"Browser Import Context Plan","summary":"Need a fix for auth.","language":"en"}')
+    def test_imports_browser_folder_payload_without_file_upload(self, _mock_ask):
         with app.test_client() as client:
             response = client.post(
                 "/api/import_chat_directory",
@@ -133,6 +188,31 @@ class ChatAnalyzerTests(unittest.TestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(state.conversations[-1]["source_file"], "my-export")
         self.assertEqual(state.conversations[-1]["source"], "ChatGPT")
+        self.assertEqual(len(state.conversations[-1]["title"].split()), 4)
+        self.assertEqual(state.conversations[-1]["summary"], "Need a fix for auth.")
+        self.assertEqual(state.conversations[-1]["language"], "en")
+        self.assertEqual(state.conversations[-1]["closure_reason"], "SOLVED")
+
+    @patch("app.LLMService.ask", side_effect=[
+        '{"title":"Auth Bug Fix Plan","summary":"Fix the auth bug now.","language":"en"}',
+        'SOLVED',
+    ])
+    def test_browser_import_normalizes_timestamp_for_chat_overview(self, _mock_ask):
+        with app.test_client() as client:
+            imported = client.post(
+                "/api/import_chat_directory",
+                json={
+                    "source_type": "ChatGPT",
+                    "folder_name": "timestamp-export",
+                    "chats": [{"title": "Auth bug", "text": "Fix auth bug now.", "created_on": 1700000000}],
+                },
+            )
+            overview = client.get("/api/chats/overview")
+
+        self.assertEqual(imported.status_code, 200)
+        self.assertEqual(overview.status_code, 200)
+        self.assertEqual(overview.get_json()["chats"][-1]["created_on"], "2023-11-14")
+        self.assertEqual(overview.get_json()["chats"][-1]["language"], "en")
 
     @patch("app.requests.get")
     def test_lists_available_ollama_models(self, mock_get):
@@ -549,6 +629,37 @@ class ChatLinkerTests(unittest.TestCase):
         merged = ChatLinker.merge_links(repo['linked_chats'], auto, repo['rejected_chat_fingerprints'])
         self.assertEqual(auto, [])
         self.assertEqual([link['fingerprint'] for link in merged], ['pinned-fp'])
+
+    @patch("app.state.flush_scan_cache")
+    @patch("app.state.note_scan_dirty", return_value=False)
+    def test_open_pin_and_unlink_keep_the_chat_body_in_ram(self, _dirty, _flush):
+        chat = self._good_chat()
+        chat['text'] = 'ledger payout details ' * 400
+        chat['messages'] = [{'role': 'assistant', 'text': chat['text']}]
+        fingerprint = ChatLinker.chat_fingerprint(chat)
+        repo = self._repo()
+        repo['linked_chats'] = [{
+            'chat_id': chat['id'],
+            'fingerprint': fingerprint,
+            'score': 0.91,
+            'reason': 'The invoice webhook work remains unfinished.',
+            'title': chat['title'],
+            'pinned': False,
+        }]
+        state.repos = [repo]
+        state.conversations = [chat]
+
+        with app.test_client() as client:
+            opened = client.get(f"/api/chats/{chat['id']}")
+            pinned = client.post(f"/api/repos/{repo['id']}/links/{fingerprint}", json={"action": "pin"})
+            unlinked = client.post(f"/api/repos/{repo['id']}/links/{fingerprint}", json={"action": "unlink"})
+            opened_again = client.get(f"/api/chats/{chat['id']}")
+
+        self.assertEqual(opened.status_code, 200)
+        self.assertEqual(opened.get_json()['text'], chat['text'])
+        self.assertTrue(pinned.get_json()['repo']['linked_chats'][0]['pinned'])
+        self.assertEqual(unlinked.get_json()['repo']['linked_chats'], [])
+        self.assertEqual(opened_again.get_json()['text'], chat['text'])
 
     def test_time_travel_quotes_linked_chats_only(self):
         good = self._good_chat()

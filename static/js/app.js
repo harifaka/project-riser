@@ -209,7 +209,8 @@ const app = {
                         messages: item.messages || [{ role: 'user', text: item.text || 'Imported chat' }],
                         summary: item.summary || '',
                         created_on: item.created_on || null,
-                        closure_reason: item.closure_reason || 'TIMEOUT',
+                        closure_reason: item.closure_reason || null,
+                        language: item.language || '',
                         tags: item.tags || {},
                         media: (item.media && item.media.length ? item.media : media).slice(0, 12),
                     });
@@ -304,14 +305,14 @@ const app = {
                 text: safeText,
                 messages: [{ role: 'user', text: safeText }],
                 created_on: null,
-                closure_reason: 'TIMEOUT',
+                closure_reason: null,
                 tags: {},
             }];
         }
     },
     parseChatgptPayload(data, fileName) {
         const results = [];
-        const addConversation = (entry) => {
+        const addConversation = entry => {
             if (!entry || !entry.text) return;
             const messages = Array.isArray(entry.messages) && entry.messages.length ? entry.messages : [{ role: 'user', text: entry.text }];
             const title = (entry.title || fileName || 'ChatGPT Export').replace(/\.[^/.]+$/, '');
@@ -322,47 +323,61 @@ const app = {
                 summary: entry.summary || '',
                 messages,
                 created_on: entry.created_on || null,
-                closure_reason: entry.closure_reason || 'TIMEOUT',
+                closure_reason: entry.closure_reason || null,
                 tags: entry.tags || {},
                 media: entry.media || [],
             });
         };
         const walk = (node) => {
             if (!node || typeof node !== 'object') return;
-            if (node.mapping || node.title || node.messages) {
-                const mapping = node.mapping || {};
-                const messageList = [];
-                const collect = (value) => {
-                    if (!value || typeof value !== 'object') return;
-                    if (Array.isArray(value)) {
-                        value.forEach(item => collect(item));
-                        return;
-                    }
-                    const author = value.author || value.message?.author || value.role || {};
-                    const role = String(author.role || author.type || value.role || 'user');
-                    const content = value.message || value.content || value.text || value.parts || value;
-                    const contentText = this.collectTextFromValue(content);
-                    if (contentText) {
-                        messageList.push({
-                            role: role.toLowerCase().includes('assistant') || role.toLowerCase().includes('model') ? 'assistant' : 'user',
-                            text: contentText,
-                        });
-                    }
-                    Object.values(value).forEach(child => collect(child));
-                };
-                if (typeof mapping === 'object') {
-                    Object.values(mapping).forEach(item => collect(item));
+            if (node.mapping && typeof node.mapping === 'object') {
+                const messageList = Object.values(node.mapping).map(item => {
+                    const message = item && (item.message || item);
+                    if (!message || typeof message !== 'object') return null;
+                    const author = message.author || item.author || {};
+                    const role = String(author.role || author.type || message.role || 'user').toLowerCase();
+                    const contentText = this.collectTextFromValue(message.content || message.text || message.parts || '');
+                    return contentText ? {
+                        role: role.includes('assistant') || role.includes('model') ? 'assistant' : 'user',
+                        text: contentText,
+                        order: Number(message.create_time || item.create_time || 0),
+                    } : null;
+                }).filter(Boolean);
+                if (messageList.some(message => message.order)) {
+                    messageList.sort((left, right) => left.order - right.order);
                 }
-                const textParts = messageList.map(item => item.text);
-                const assembled = textParts.join('\n\n');
+                const messages = messageList.map(({ role, text }) => ({ role, text }));
+                const assembled = messages.map(item => item.text).join('\n\n');
                 if (assembled) {
                     addConversation({
                         title: node.title || 'ChatGPT Export',
                         text: assembled,
-                        messages: messageList.length ? messageList : [{ role: 'user', text: assembled }],
+                        messages,
                         created_on: node.create_time || node.update_time || null,
                     });
                 }
+                return;
+            }
+            if (Array.isArray(node.messages)) {
+                const messages = node.messages.map(message => {
+                    if (!message || typeof message !== 'object') return null;
+                    const role = String(message.author?.role || message.role || 'user').toLowerCase();
+                    const contentText = this.collectTextFromValue(message.content || message.text || message.parts || '');
+                    return contentText ? {
+                        role: role.includes('assistant') || role.includes('model') ? 'assistant' : 'user',
+                        text: contentText,
+                    } : null;
+                }).filter(Boolean);
+                const assembled = messages.map(item => item.text).join('\n\n');
+                if (assembled) {
+                    addConversation({
+                        title: node.title || 'ChatGPT Export',
+                        text: assembled,
+                        messages,
+                        created_on: node.create_time || node.update_time || null,
+                    });
+                }
+                return;
             }
             Object.values(node).forEach(child => {
                 if (child && typeof child === 'object') walk(child);
@@ -378,7 +393,7 @@ const app = {
                 text: fallbackText,
                 messages: [{ role: 'user', text: fallbackText }],
                 created_on: null,
-                closure_reason: 'TIMEOUT',
+                closure_reason: null,
                 tags: {},
             }];
         }
@@ -396,7 +411,7 @@ const app = {
                 const messageList = node.messages
                     .map(msg => {
                         if (!msg || typeof msg !== 'object') return null;
-                        const role = String(msg.role || msg.author || 'user');
+                        const role = String(msg.role || msg.author?.role || msg.author || 'user');
                         const text = this.collectTextFromValue(msg.text || msg.content || msg.parts || msg.value || msg.response || msg.prompt || '');
                         if (!text) return null;
                         return {
@@ -413,9 +428,9 @@ const app = {
                         text,
                         messages: messageList,
                         created_on: node.update_time || node.updateTime || node.timestamp || node.create_time || null,
-                        closure_reason: 'TIMEOUT',
                         tags: {},
                     });
+                    return;
                 }
             }
             Object.values(node).forEach(child => collectMatches(child));
@@ -424,32 +439,35 @@ const app = {
         if (results.length) return results;
         const fallbackText = this.collectTextFromValue(data);
         if (fallbackText) {
-            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text: fallbackText, messages: [{ role: 'user', text: fallbackText }], created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text: fallbackText, messages: [{ role: 'user', text: fallbackText }], created_on: null, tags: {} }];
         }
         return [];
     },
     parseGeminiHtml(html, fileName) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
-        const articleNodes = [...doc.querySelectorAll('article, .message, .chat-message, .conversation, .msg')];
+        const articleSelector = 'article, [data-message-author-role], .message, .chat-message, .conversation, .msg';
+        const articleNodes = [...doc.querySelectorAll(articleSelector)].filter(node => !node.querySelector(articleSelector));
         const messages = [];
         articleNodes.forEach(node => {
-            const role = node.className && String(node.className).toLowerCase().includes('model') ? 'assistant' : (node.className && String(node.className).toLowerCase().includes('user') ? 'user' : 'user');
+            const roleText = `${node.getAttribute('data-message-author-role') || ''} ${node.className || ''}`.toLowerCase();
+            const role = roleText.includes('model') || roleText.includes('assistant') ? 'assistant' : 'user';
             const text = this.collectTextFromValue(node.textContent || node.innerText || '');
             if (text) messages.push({ role, text });
         });
         if (!messages.length) {
-            const paragraphs = [...doc.querySelectorAll('p, li, div, span, pre')];
+            const paragraphs = [...doc.querySelectorAll('p, li, pre')];
             paragraphs.forEach(node => {
                 const text = this.collectTextFromValue(node.textContent || node.innerText || '');
                 if (text) messages.push({ role: 'user', text });
             });
         }
         if (!messages.length) {
-            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text: html.slice(0, 4000), messages: [{ role: 'user', text: html.slice(0, 4000) }], created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+            const text = this.collectTextFromValue(doc.body?.textContent || html);
+            return [{ title: fileName || 'Gemini Export', source: 'Gemini', text, messages: [{ role: 'user', text }], created_on: null, tags: {} }];
         }
         const text = messages.map(item => item.text).join('\n\n');
-        return [{ title: doc.title || fileName || 'Gemini Export', source: 'Gemini', text, messages, created_on: null, closure_reason: 'TIMEOUT', tags: {} }];
+        return [{ title: doc.title || fileName || 'Gemini Export', source: 'Gemini', text, messages, created_on: null, tags: {} }];
     },
     collectTextFromValue(value) {
         if (!value) return '';
@@ -530,18 +548,30 @@ const app = {
         });
         document.getElementById('readerMedia').innerHTML = '';
     },
-    renderChatReader(chat, mediaUrls) {
+    renderChatReader(chat, mediaUrls, linkContext = null) {
         const title = document.getElementById('readerTitle');
         const meta = document.getElementById('readerMeta');
         const summary = document.getElementById('readerSummary');
         const tags = document.getElementById('readerTags');
         const text = document.getElementById('readerText');
         const media = document.getElementById('readerMedia');
+        const linkDetails = document.getElementById('readerLinkContext');
 
         title.textContent = chat.title || 'Conversation';
-        meta.textContent = `${chat.source || ''} · ${chat.created_on || 'undated'} · ${chat.closure_reason || ''}`;
+        meta.textContent = `${chat.source || ''} · ${chat.created_on || 'undated'} · ${chat.closure_reason || ''}${chat.language ? ` · ${chat.language}` : ''}`;
         summary.textContent = chat.summary || '';
         tags.innerHTML = (chat.visible_tags || []).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
+        if (linkDetails) {
+            if (linkContext) {
+                const score = Number(linkContext.score);
+                const scoreLabel = Number.isFinite(score) ? `${Math.round(score * 100)}%` : 'unscored';
+                linkDetails.textContent = `Match score: ${scoreLabel} · ${linkContext.reason || 'No behavioral reasoning available.'}`;
+                linkDetails.hidden = false;
+            } else {
+                linkDetails.textContent = '';
+                linkDetails.hidden = true;
+            }
+        }
 
         const messageList = Array.isArray(chat.messages) && chat.messages.length ? chat.messages : [{ role: 'user', text: chat.text || '' }];
         text.innerHTML = messageList.map(msg => {
@@ -569,10 +599,10 @@ const app = {
             return `<div class="media-item"><a href="${asset.url}" target="_blank" rel="noopener noreferrer">${this.escape(asset.filename || 'Attachment')}</a></div>`;
         }).join('');
     },
-    async openChat(id) {
+    async openChat(id, linkContext = null) {
         const data = await this.fetchJson(`/api/chats/${encodeURIComponent(id)}`);
         const mediaUrls = await this.loadChatMedia(data);
-        this.renderChatReader(data, mediaUrls);
+        this.renderChatReader(data, mediaUrls, linkContext);
         document.getElementById('chatReaderModal').style.display = 'flex';
     },
     async retagChats() {
@@ -863,7 +893,6 @@ const app = {
                 <button class="btn outline" onclick="app.deleteChatFile('${this.escape(file.name)}')">Delete</button>
             </div>
         `).join('');
-        document.getElementById('assignModal').style.display = 'flex';
     },
     async submitAssign(action) {
         const tag_ids = [...document.querySelectorAll('#assignTagList input:checked')].map(input => input.value);
@@ -949,11 +978,11 @@ const app = {
     renderRepos(repos, containerId = 'repoContainer') {
         const c = document.getElementById(containerId);
         if (!c) return;
-        this.repoMap = {};
+        if (containerId === 'repoContainer') this.repoMap = {};
         const seen = new Set();
-            repos.forEach(repo => {
+        repos.forEach(repo => {
             const id = String(repo.id);
-            this.repoMap[id] = repo;
+            if (containerId === 'repoContainer') this.repoMap[id] = repo;
             seen.add(id);
             let card = c.querySelector(`[data-repo-id="${id}"]`);
             if (!card) {
@@ -1042,7 +1071,7 @@ const app = {
             const fingerprint = row.dataset.fingerprint;
             const link = links.find(item => item.fingerprint === fingerprint);
             row.querySelector('[data-action="open"]').addEventListener('click', () => {
-                if (link && link.chat_id) this.openChat(link.chat_id);
+                if (link && link.chat_id) this.openChat(link.chat_id, link);
             });
             row.querySelector('[data-action="pin"]').addEventListener('click', () => {
                 this.updateLink(fingerprint, link && link.pinned ? 'unpin' : 'pin');
@@ -1176,15 +1205,6 @@ const app = {
         c.querySelectorAll('[data-chat-id]').forEach(card => {
             if (!seen.has(card.dataset.chatId)) card.remove();
         });
-    },
-    async openChat(id) {
-        const data = await this.fetchJson(`/api/chats/${encodeURIComponent(id)}`);
-        document.getElementById('readerTitle').textContent = data.title || 'Conversation';
-        document.getElementById('readerMeta').textContent = `${data.source || ''} · ${data.created_on || 'undated'} · ${data.closure_reason || ''}`;
-        document.getElementById('readerSummary').textContent = data.summary || '';
-        document.getElementById('readerTags').innerHTML = (data.visible_tags || []).map(name => `<span class="badge">${this.escape(name)}</span>`).join('');
-        document.getElementById('readerText').textContent = data.text || '';
-        document.getElementById('chatReaderModal').style.display = 'flex';
     },
     async retagChats() {
         document.getElementById('chatStatus').innerText = 'Recalculating tags...';
