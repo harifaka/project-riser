@@ -724,6 +724,82 @@ class LayaDecisionService:
 
 class ChatAnalyzer:
     @staticmethod
+    def _fallback_title(text):
+        words = re.findall(r"[A-Za-z0-9']+", (text or ''))
+        meaningful = [w for w in words if len(w) > 2]
+        if len(meaningful) < 4:
+            fallback = (text or '').split()
+            meaningful = [w for w in fallback if w.strip()]
+        return ' '.join(meaningful[:4]).strip()[:80] or 'Imported Chat'
+
+    @staticmethod
+    def _normalize_summary(summary):
+        cleaned = re.sub(r'\s+', ' ', str(summary or '').strip())
+        if not cleaned:
+            return 'No summary available.'
+        sentence = re.split(r'(?<=[.!?])\s+', cleaned)[0].strip()
+        if not sentence:
+            return 'No summary available.'
+        if not sentence.endswith(('.', '!', '?')):
+            sentence += '.'
+        return sentence
+
+    @staticmethod
+    def _detect_language(text):
+        text = (text or '')
+        if re.search(r'[\u0400-\u04FF]', text):
+            return 'ru'
+        if re.search(r'[\u3040-\u30FF\u4E00-\u9FFF]', text):
+            return 'ja'
+        if re.search(r'[\uAC00-\uD7AF]', text):
+            return 'ko'
+        return 'en'
+
+    @staticmethod
+    def _parse_summary_payload(raw):
+        if not raw:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        if not text.startswith('{'):
+            match = re.search(r'\{.*\}', text, flags=re.DOTALL)
+            if match:
+                text = match.group(0)
+            else:
+                return None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if 'title' not in payload and 'summary' not in payload and 'language' not in payload:
+            return None
+        return payload
+
+    @staticmethod
+    def _build_strict_summary(text, url, model):
+        prompt = (
+            'Return JSON only with keys "title", "summary", and "language". '
+            'The title must be exactly 4 words, the summary must be exactly one sentence, and language must be a short code like "en" or "es".\n'
+            f'Text:\n{text[:4000]}'
+        )
+        raw = LLMService.ask(prompt, url, model)
+        payload = ChatAnalyzer._parse_summary_payload(raw)
+        if not payload:
+            return None
+        title = str(payload.get('title') or '').strip()
+        summary = str(payload.get('summary') or '').strip()
+        language = str(payload.get('language') or '').strip() or ChatAnalyzer._detect_language(text)
+        if len(title.split()) != 4:
+            title = ChatAnalyzer._fallback_title(text)
+        if len(title.split()) != 4:
+            title = ' '.join(title.split()[:4]) if title.split() else 'Imported Chat'
+        summary = ChatAnalyzer._normalize_summary(summary or text)
+        return {'title': title, 'summary': summary, 'language': language or 'en'}
+
+    @staticmethod
     def _clean_text(value):
         if not value:
             return ''
@@ -878,7 +954,6 @@ class ChatAnalyzer:
             text_parts = conv.get('text_parts', [])
             if not text_parts:
                 continue
-            title = conv.get('title', 'Imported Chat')
             source = conv.get('source', 'Gemini')
             full_text = ' '.join(text_parts)
             last_messages = ' '.join(text_parts[-3:])
@@ -886,7 +961,15 @@ class ChatAnalyzer:
             closure = LLMService.ask(prompt, url, model)
             if closure not in ['SOLVED', 'CONTEXT_LOST', 'TIMEOUT']:
                 closure = 'TIMEOUT'
-            summary = LLMService.clamp_description(full_text, state.settings.get('description_word_budget', 18))
+            summary_payload = ChatAnalyzer._build_strict_summary(full_text, url, model)
+            if summary_payload:
+                title = summary_payload['title']
+                summary = summary_payload['summary']
+                language = summary_payload['language']
+            else:
+                title = ChatAnalyzer._fallback_title(full_text)
+                summary = ChatAnalyzer._normalize_summary(LLMService.clamp_description(full_text, state.settings.get('description_word_budget', 18)))
+                language = ChatAnalyzer._detect_language(full_text)
             tags = LayaDecisionService().score(full_text)
             extracted.append({
                 'id': str(uuid.uuid4()),
@@ -894,6 +977,7 @@ class ChatAnalyzer:
                 'source': source,
                 'text': full_text[:3000],
                 'summary': summary,
+                'language': language,
                 'closure_reason': closure,
                 'created_on': conv.get('created_on'),
                 'tags': tags,
@@ -902,11 +986,25 @@ class ChatAnalyzer:
 
 
 class RepoAnalyzer:
+    MENTAL_DEBT_PATTERNS = (
+        r'(?i)\b(?:fixme|todo)\b',
+        r'(?i)\b(?:i hate this part|this is a mess|what a mess|ugly hack|quick hack|temporary workaround|workaround)\b',
+        r'(?i)\b(?:hack|mess|broken|frustrat(?:ed|ing)|painful)\b',
+    )
+
     def __init__(self, token, ollama_url, ollama_model):
         self.token = token
         self.headers = {'Authorization': f'token {token}'}
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model
+
+    @classmethod
+    def _mental_debt_hits(cls, file_name, line, index):
+        for pattern in cls.MENTAL_DEBT_PATTERNS:
+            if re.search(pattern, line):
+                snippet = re.sub(r'\s+', ' ', line).strip()
+                return f'Mental debt: {file_name}:{index + 1} - {snippet[:90]}'
+        return None
 
     def _recent_commits(self, repo_name):
         try:
@@ -1080,7 +1178,7 @@ class RepoAnalyzer:
 
     def _analyze_zip(self, repo_data, generation, name, zip_content):
 
-        data = {'todos': [], 'secrets': [], 'env_vars': set(), 'db_schemas': set(), 'tech_stack': [], 'custom_lines': 0, 'smells': [], 'endpoints': []}
+        data = {'todos': [], 'secrets': [], 'env_vars': set(), 'db_schemas': set(), 'tech_stack': [], 'custom_lines': 0, 'smells': [], 'endpoints': [], 'mental_debt': []}
         snippets = []
         sec_pat = re.compile(r'(?i)(api_key|secret|password|token)\s*[:=]\s*[\'\"][a-zA-Z0-9_\-]{10,}[\'\"]')
 
@@ -1112,6 +1210,10 @@ class RepoAnalyzer:
                         for i, line in enumerate(lines):
                             if 'TODO:' in line or 'FIXME:' in line:
                                 data['todos'].append(line.strip()[:60])
+                            mental_hit = self._mental_debt_hits(fname.split('/')[-1], line, i)
+                            if mental_hit:
+                                data['mental_debt'].append(mental_hit)
+                                data['smells'].append(mental_hit)
                             if sec_pat.search(line):
                                 data['secrets'].append(fname.split('/')[-1])
                             if re.search(r'@app\.route|router\.(get|post|put|delete)|app\.route|app\.(get|post|put|delete)', line):
@@ -1126,7 +1228,11 @@ class RepoAnalyzer:
                         pass
 
         commits = '\n'.join(repo_data.get('commits', []))
-        mood = LLMService.ask(f"Analyze the developer's mood from these commits. Are they FRUSTRATED, BORED, or DONE? Reply one word:\n{commits}", self.ollama_url, self.ollama_model)
+        debt_hint = ' '.join(data['mental_debt'][:6])
+        mood_prompt = f"Analyze the developer's mood from these commits. Are they FRUSTRATED, BORED, or DONE? Reply one word:\n{commits}"
+        if debt_hint:
+            mood_prompt = f"{mood_prompt}\nMental debt markers:\n{debt_hint}"
+        mood = LLMService.ask(mood_prompt, self.ollama_url, self.ollama_model)
         tshirt = LLMService.ask(f"Estimate resurrection effort (S, M, L, XL) based on {data['custom_lines']} lines of code and {len(data['todos'])} TODOs. Reply with one letter/word only.", self.ollama_url, self.ollama_model)
         desc = LLMService.ask(f"Write a summary of at most {state.settings.get('description_word_budget', 18)} words of this code:\n{' '.join(snippets)}", self.ollama_url, self.ollama_model) if snippets else 'No code extracted.'
         desc = LLMService.clamp_description(desc, state.settings.get('description_word_budget', 18))
@@ -1150,6 +1256,7 @@ class RepoAnalyzer:
             'custom_lines': data['custom_lines'],
             'smells': data['smells'],
             'todos': data['todos'],
+            'mental_debt': data['mental_debt'],
             'secrets': len(data['secrets']),
             'tech_stack': sorted(set(data['tech_stack'] + list(self._detect_tech_stack(zip_content)))),
             'env_vars': sorted(data['env_vars']),

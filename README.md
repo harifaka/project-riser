@@ -27,14 +27,14 @@ The repo graveyard includes:
 - hash cache so an unchanged repo and an unchanged tag list skip reprocessing
 - FIFO in-memory zip cache for active repo context
 - custom vs boilerplate heuristics for code footprint analysis
-- secret, TODO, smell, env, schema, and endpoint extraction from ZIP contents
+- secret, TODO, smell, env, schema, endpoint, and mental-debt extraction from ZIP contents
 - abandonment scoring based on age and code signals
 - adjustable description length for repo summaries
 - Time Travel prompt generation for resuming work on an abandoned project
 
 ## Chat corpus
 
-The chat pipeline accepts ChatGPT JSON and Gemini HTML/JSON exports and keeps the original content in RAM. On import it stores a short summary, a closure label (`SOLVED`, `CONTEXT_LOST`, `TIMEOUT`), a calendar day when the export has one, and Laya scores for every current tag.
+The chat pipeline accepts ChatGPT JSON and Gemini HTML/JSON exports and keeps the original content in RAM. On import it stores a strict summary format: a 4-word title, a single-sentence description, a detected language hint, a closure label (`SOLVED`, `CONTEXT_LOST`, `TIMEOUT`), a calendar day when the export has one, and Laya scores for every current tag.
 
 The Chat tab can be read while tagging runs. It shows a source and closure summary, a GitHub-style day heatmap, and a reverse count of how many conversations match each tag at the confidence threshold. Opening a conversation shows the summary and the stored text. **Retag conversations** rescores every loaded conversation against the current tag list and does not start a GitHub sync. Manual tag assignments stay unless that tag was removed.
 

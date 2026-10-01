@@ -1,5 +1,7 @@
 import datetime
+import io
 import unittest
+import zipfile
 from unittest.mock import Mock, patch
 
 from app import (
@@ -9,6 +11,7 @@ from app import (
     ChatLinker,
     LayaDecisionService,
     LLMService,
+    RepoAnalyzer,
     TimeTravelService,
     app,
     chat_overview_payload,
@@ -255,6 +258,46 @@ class ChatAnalyzerTests(unittest.TestCase):
     def test_description_is_clamped_to_word_budget(self):
         text = "one two three four five six seven"
         self.assertEqual(LLMService.clamp_description(text, 4), "one two three four")
+
+    @patch("app.LLMService.ask")
+    def test_chat_summary_is_strict_four_word_title_and_single_sentence(self, mock_ask):
+        mock_ask.side_effect = [
+            'SOLVED',
+            '{"title": "Auth bug triage plan", "summary": "The login endpoint fails for new users.", "language": "en"}',
+        ]
+        text = "We need to fix the login endpoint. It fails for new users after signup."
+
+        conversations = ChatAnalyzer.parse_and_analyze(text, "http://localhost:11434", "llama3.1")
+
+        self.assertEqual(len(conversations), 1)
+        self.assertEqual(conversations[0]["title"], "Auth bug triage plan")
+        self.assertEqual(len(conversations[0]["title"].split()), 4)
+        self.assertEqual(conversations[0]["language"], "en")
+        self.assertTrue(conversations[0]["summary"].endswith('.'))
+        self.assertEqual(conversations[0]["summary"].count('.'), 1)
+
+    def test_repo_scan_flags_mental_debt_comments(self):
+        state.repos = [{
+            'id': 99,
+            'name': 'mental-debt',
+            'full_name': 'demo/mental-debt',
+            'status': 'ready',
+            'updated_at': '2024-01-01T00:00:00Z',
+            'description': 'placeholder',
+        }]
+        state.scan_generation = 1
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, 'w') as zf:
+            zf.writestr('app.py', 'def auth():\n    # FIXME: I hate this part\n    # quick hack for login\n    return True\n')
+        with patch("app.LLMService.ask", side_effect=['DONE', 'M']):
+            RepoAnalyzer(token='x', ollama_url='http://localhost:11434', ollama_model='llama3.1')._analyze_zip(
+                {'id': 99, 'name': 'mental-debt', 'full_name': 'demo/mental-debt', 'updated_at': '2024-01-01T00:00:00Z'},
+                1,
+                'demo/mental-debt',
+                zip_bytes.getvalue(),
+            )
+        repo = state.repos[0]
+        self.assertTrue(any('hate this part' in item.lower() or 'quick hack' in item.lower() for item in repo.get('smells', [])))
 
     def test_settings_modal_does_not_repeat_tag_editor_controls(self):
         with app.test_client() as client:

@@ -3,10 +3,10 @@
     {
       "name": "Default",
       "files": [
-        "tests/test_chat_parser.py",
         ".vscode/changelists.json",
+        "tests/test_chat_parser.py",
         "app.py",
-        "docker-compose.yml",
+        "README.md",
         "ROADMAP.md"
       ]
     }

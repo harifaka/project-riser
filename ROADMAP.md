@@ -96,16 +96,21 @@ The project currently ships the following core behavior:
 - Percent progress, scan log, and in-place card updates
 - Laya tagging for repos and conversations, with a calibration modal
 - Tag editor and bulk assign or unassign
-- **[NEEDS FIX]** Chat reader with heatmap, summary, and per-tag counts
+- Chat reader with heatmap, summary, source metadata, and per-tag counts
 - Conversation retag independent of GitHub sync
-- **[NEEDS FIX]** Behavior-based conversation linking, feeding Time Travel
+- Behavior-based conversation linking that feeds Time Travel and supports pin/unlink flows
+- Strict chat summaries with a 4-word title, single-sentence description, and language hint
+- Mental-debt comment detection from ZIP content, surfaced in the repo smell/mood signal
 
 ## 10. Open Items & Immediate Action Plan (For Cursor)
 
-**High Priority: Debugging & Fixing Existing Logic**
-- **Fix Chat Viewer:** The current chat viewer and RAM-based reading logic is unstable/buggy. Debug the parsing of ChatGPT/Gemini JSONs so it correctly displays conversations, summaries, and match counts on the UI.
-- **Fix AI Linker (Repo-Chat Matching):** The mechanism matching loaded conversations to repositories is failing or inaccurate. Fix the Laya confidence threshold filtering and Ollama prompt pipeline so chats are reliably linked, pinned, and displayed on repo cards.
+The high-priority roadmap items above are now implemented and verified in the app.
 
-**Core Logic Enhancements**
-- **Strict Chat Summarization (System 2):** Update the Ollama prompt for chat imports to strictly enforce an Extractive-Abstractive format: exactly a 4-word title, a 1-sentence summary, and language detection.
-- **Mental Debt / Emotional Comment Hunter:** Expand the RAM-based ZIP code extraction to actively hunt for emotional/frustrated developer comments (e.g., `// FIXME`, `// TODO`, `// I hate this part`, `// hack`). Feed this data directly into the Mood X-Ray calculation.
+**Completed fixes**
+- Chat viewer and RAM-based parsing for ChatGPT/Gemini exports are working in the UI.
+- Repository-to-chat matching now filters by confidence and keeps the best behavioral overlaps for Time Travel.
+- Strict chat summaries and emotional-comment extraction are included in the code path that imports conversations and analyzes ZIPs.
+
+**Optional follow-ups**
+- Extend the banter detector with more domain-specific emotional phrases if the team wants a broader signal set.
+- Add more structured analytics around mental debt, such as a separate chart or threshold-based alerting.
